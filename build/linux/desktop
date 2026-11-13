@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=My Product
+Comment=A hgplayer application
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/hgplayer.exe %u
+Terminal=false
+Type=Application
+Icon=hgplayer.exe
+Categories=Utility;
+StartupWMClass=hgplayer.exe
+
+ 

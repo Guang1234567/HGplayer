@@ -1,0 +1,23 @@
+# Wails 构建产物
+.task
+bin
+hgplayer.exe
+frontend/dist
+frontend/node_modules
+frontend/bindings
+
+# 平台构建临时产物
+build/linux/appimage/build
+build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+
+# 移动端生成文件（每机绝对路径）
+build/ios/xcode/overlay.json
+build/ios/xcode/gen/
+build/android/overlay.json
+build/android/gen/
+
+# 本地媒体测试样本（体积大，不入库；保留占位说明）
+media/*.mp4
+
+# 日志与本地数据
+*.log
