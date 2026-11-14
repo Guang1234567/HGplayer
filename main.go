@@ -93,7 +93,7 @@ func newApp() (*app, error) {
 		Logger:        logger,
 		ArchiveDir:    dirs.Data,
 		MediaProvider: localMediaProvider,
-	}, sign.NoopSigner{})
+	}, sign.PlayerSigner{})
 
 	// 预加载匿名设备身份（不存在则稍后由上游注册流程创建）。
 	if info, exists, err := device.Load(dirs.Data); err != nil {
