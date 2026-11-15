@@ -37,7 +37,7 @@ func WithGuard(g *guard.Guard) Option {
 
 // NewClient 创建协议客户端。
 func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
-	g := guard.New("fqnovel.com", "snssdk.com")
+	g := guard.New(AllowedDomains...)
 	c := &Client{
 		guard:       g,
 		up:          upstream.New(upstream.Options{Guard: g, Signer: signer, DeviceID: device.DeviceID, IID: device.IID, Timeout: 15 * time.Second}),

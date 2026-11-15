@@ -16,9 +16,10 @@ const (
 	// SearchAPI 搜索接口。
 	SearchAPI = "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v"
 
-	// 允许访问的上游域名（与源实现一致）。
-	allowedDomains = "fqnovel.com,snssdk.com"
 )
+
+// AllowedDomains 是允许访问的上游域名白名单。
+var AllowedDomains = []string{"fqnovel.com", "snssdk.com", "hongguoduanju.com"}
 
 // 客户端默认 UA。
 const (

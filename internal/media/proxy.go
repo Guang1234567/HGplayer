@@ -124,7 +124,27 @@ func copyMediaHeaders(dst, src http.Header) {
 	}
 }
 
-// isAllowedMediaURL 校验媒体地址：https 且无可信边界之外的凭证。
+// allowedMediaHosts 是可代理的媒体域名后缀。
+//
+// 与协议层一致：开发环境通过域名重定向接入，因此按域名校验即可。
+// 需要接入其他 CDN 时在此追加。
+var allowedMediaHosts = []string{
+	"hongguoduanju.com",
+	"novelquickapp.com",
+	"fqnovel.com",
+	"snssdk.com",
+	"fqnovelpic.com",
+	"qznovelvod.com",
+	"fqnovelvod.com",
+	"douyinvod.com",
+	"bytecdn.cn",
+	"byteimg.com",
+	"volces.com",
+	"ibytedtos.com",
+	"bytedance.com",
+}
+
+// isAllowedMediaURL 校验媒体地址：https、无凭证、主机命中媒体白名单。
 func isAllowedMediaURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -136,9 +156,14 @@ func isAllowedMediaURL(raw string) bool {
 	if u.User != nil {
 		return false
 	}
-	host := u.Hostname()
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	if host == "" || strings.Contains(host, "..") {
 		return false
 	}
-	return true
+	for _, d := range allowedMediaHosts {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
 }

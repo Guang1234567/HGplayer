@@ -179,4 +179,4 @@ func randomToken() string {
 }
 
 // version 由构建期注入。
-var version = "0.0.0-spike"
+var version = "0.1.0"
