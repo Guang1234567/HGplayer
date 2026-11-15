@@ -26,12 +26,10 @@ export class ApiException extends Error {
     this.code = code;
   }
 
-  /** 是否为本地会话未建立。 */
   get isLocalSession(): boolean {
     return this.code === ErrorCode.LOCAL_SESSION;
   }
 
-  /** 是否为账号凭证过期。 */
   get isAccountToken(): boolean {
     return this.code === ErrorCode.ACCOUNT_TOKEN;
   }
@@ -59,7 +57,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       body = await res.json();
     } catch {
-      // 非 JSON 错误体，保留默认提示。
+      /* 非 JSON 错误体，保留默认提示 */
     }
     throw new ApiException(res.status, body.code ?? 'UNKNOWN', body.error);
   }
@@ -70,31 +68,80 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** 系统接口。 */
-export const api = {
-  version: () => request<{ version: string }>('/api/system/version'),
+// —— 类型 ——
 
-  /** 读取当前登录态。 */
-  account: () => request<{ logged_in: boolean; account_id: string; display_name: string }>('/api/account'),
+/** 目录卡片。 */
+export interface SeriesCard {
+  series_id: string;
+  series_title: string;
+  cover: string;
+  episode_count: number;
+  description: string;
+  tags: string[];
+}
 
-  /** 登录。 */
-  login: (accountId: string, displayName: string) =>
-    request<{ success: boolean }>('/api/account/login', {
-      method: 'POST',
-      body: JSON.stringify({ account_id: accountId, display_name: displayName }),
-    }),
+/** 目录浏览结果。 */
+export interface BrowseResult {
+  results: SeriesCard[];
+  page: number;
+  hasMore: boolean;
+}
 
-  /** 登出。 */
-  logout: () => request<{ success: boolean }>('/api/account/logout', { method: 'POST' }),
+/** 搜索结果。 */
+export interface SearchResult {
+  results: SeriesCard[];
+  page: number;
+}
 
-  /** 本地档案包：观看历史。 */
-  history: () => request<{ history: ArchiveProgress[] }>('/api/archive/history'),
+/** 分集简要信息。 */
+export interface EpisodeBrief {
+  vid: string;
+  title: string;
+  episode_index: number;
+  position_sec: number;
+  duration_sec: number;
+}
 
-  /** 本地档案包：收藏。 */
-  favorites: () => request<{ favorites: ArchiveFavorite[] }>('/api/archive/favorites'),
-};
+/** 本地保存的进度。 */
+export interface SavedProgress {
+  episode_index: number;
+  position_sec: number;
+  duration_sec: number;
+}
 
-/** 观看进度。 */
+/** 剧集详情。 */
+export interface SeriesDetail {
+  series_id: string;
+  series_title: string;
+  cover: string;
+  description: string;
+  episodes: EpisodeBrief[];
+  saved_progress?: SavedProgress;
+  is_favorite: boolean;
+}
+
+/** 视频元信息。 */
+export interface VideoMeta {
+  definition: string;
+  vwidth: number;
+  vheight: number;
+  bitrate: number;
+  codec_type: string;
+}
+
+/** 单集播放信息。 */
+export interface PlayInfo {
+  vid: string;
+  url: string;
+  backup_url?: string;
+  codec: string;
+  encrypted: boolean;
+  content_key?: string;
+  video_meta?: VideoMeta;
+  definition?: string;
+}
+
+/** 观看进度（档案包）。 */
 export interface ArchiveProgress {
   series_id: string;
   series_title?: string;
@@ -105,10 +152,64 @@ export interface ArchiveProgress {
   updated_at: number;
 }
 
-/** 收藏项。 */
+/** 收藏项（档案包）。 */
 export interface ArchiveFavorite {
   series_id: string;
   series_title?: string;
   cover?: string;
   updated_at: number;
 }
+
+// —— 接口 ——
+
+/** 系统接口。 */
+export const api = {
+  version: () => request<{ version: string }>('/api/system/version'),
+
+  // 账号
+  account: () =>
+    request<{ logged_in: boolean; account_id: string; display_name: string }>('/api/account'),
+  login: (accountId: string, displayName: string) =>
+    request<{ success: boolean }>('/api/account/login', {
+      method: 'POST',
+      body: JSON.stringify({ account_id: accountId, display_name: displayName }),
+    }),
+  logout: () => request<{ success: boolean }>('/api/account/logout', { method: 'POST' }),
+
+  // 协议：目录 / 搜索 / 详情 / 取址
+  catalog: (category: string, genre: string, page: number) =>
+    request<BrowseResult>(
+      `/api/catalog?category=${encodeURIComponent(category)}&genre=${encodeURIComponent(genre)}&page=${page}`,
+    ),
+  search: (keyword: string, page: number) =>
+    request<SearchResult>(`/api/search?q=${encodeURIComponent(keyword)}&page=${page}`),
+  series: (id: string) => request<SeriesDetail>(`/api/series/${encodeURIComponent(id)}`),
+  play: (vid: string) => request<PlayInfo>(`/api/play/${encodeURIComponent(vid)}`),
+
+  // 档案包
+  history: () => request<{ history: ArchiveProgress[] }>('/api/archive/history'),
+  favorites: () => request<{ favorites: ArchiveFavorite[] }>('/api/archive/favorites'),
+  saveProgress: (p: {
+    series_id: string;
+    series_title?: string;
+    cover?: string;
+    episode_index: number;
+    position_sec: number;
+    duration_sec?: number;
+  }) =>
+    request<{ success: boolean }>('/api/archive/progress', {
+      method: 'POST',
+      body: JSON.stringify(p),
+    }),
+  toggleFavorite: (f: { series_id: string; series_title?: string; cover?: string }) =>
+    request<{ favorited: boolean }>('/api/archive/favorites/toggle', {
+      method: 'POST',
+      body: JSON.stringify(f),
+    }),
+  searchHistory: () => request<{ history: string[] }>('/api/archive/search-history'),
+  updateSearchHistory: (action: 'add' | 'delete' | 'clear', value: string) =>
+    request<{ history: string[] }>('/api/archive/search-history', {
+      method: 'POST',
+      body: JSON.stringify({ action, value }),
+    }),
+};

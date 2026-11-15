@@ -5,7 +5,9 @@ import (
 
 	"hgplayer/internal/account"
 	"hgplayer/internal/archive"
+	"hgplayer/internal/hgproto"
 	"hgplayer/internal/logx"
+	"hgplayer/internal/media"
 )
 
 // Config 是服务运行期配置。
@@ -22,8 +24,12 @@ type Config struct {
 	Archive *archive.Store
 	// ArchiveDir 是本地档案包的数据目录。
 	ArchiveDir string
+	// Proto 是红果协议客户端；为空时依赖协议的路由返回 503。
+	Proto *hgproto.Client
+	// MediaProxy 是上游媒体代理；非空时 /media 走代理。
+	MediaProxy *media.Proxy
+	// MediaProvider 提供媒体源的字节总数与只读句柄。
 	//
-	// 由 internal/service 在真实实现中注入，spike 阶段使用本地文件。
 	// 返回的 io.ReadSeeker 需支持随机读取（http.ServeContent 依赖 Seek）。
 	MediaProvider MediaProvider
 }

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -16,7 +17,9 @@ import (
 
 	"hgplayer/internal/apppath"
 	"hgplayer/internal/device"
+	"hgplayer/internal/hgproto"
 	"hgplayer/internal/logx"
+	"hgplayer/internal/media"
 	"hgplayer/internal/server"
 	"hgplayer/internal/sign"
 )
@@ -55,14 +58,14 @@ func main() {
 
 	// 主窗口：加载同源根路径。
 	w.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:             "红果短剧",
-		Width:             1280,
-		Height:            800,
-		MinWidth:          960,
-		MinHeight:         640,
-		Mac:               application.MacWindow{InvisibleTitleBarHeight: 50},
-		BackgroundColour:  application.NewRGB(17, 19, 24),
-		URL:               "/",
+		Title:            "红果短剧",
+		Width:            1280,
+		Height:           800,
+		MinWidth:         960,
+		MinHeight:        640,
+		Mac:              application.MacWindow{InvisibleTitleBarHeight: 50},
+		BackgroundColour: application.NewRGB(17, 19, 24),
+		URL:              "/",
 	})
 
 	if err := w.Run(); err != nil {
@@ -70,7 +73,7 @@ func main() {
 	}
 }
 
-// newApp 初始化数据目录、日志器与应用服务。
+// newApp 初始化数据目录、设备身份、协议客户端与应用服务。
 func newApp() (*app, error) {
 	dirs, err := apppath.Resolve()
 	if err != nil {
@@ -87,32 +90,82 @@ func newApp() (*app, error) {
 		TailLines: 200,
 	})
 
-	svc := server.New(server.Config{
-		Version:        version,
-		SessionToken:   randomToken(),
-		Logger:        logger,
-		ArchiveDir:    dirs.Data,
-		MediaProvider: localMediaProvider,
-	}, sign.PlayerSigner{})
-
-	// 预加载匿名设备身份（不存在则稍后由上游注册流程创建）。
-	if info, exists, err := device.Load(dirs.Data); err != nil {
+	// 加载或生成匿名设备身份。
+	info, exists, err := device.Load(dirs.Data)
+	if err != nil {
 		logger.Warn("加载设备身份失败", "err", err)
-	} else if exists {
+	}
+	if !exists {
+		info = device.Generate()
+		if err := device.Save(dirs.Data, info); err != nil {
+			logger.Warn("保存设备身份失败", "err", err)
+		}
+		logger.Info("已生成匿名设备身份", "device_id", info.DeviceID)
+	} else {
 		logger.Info("已加载本地设备身份", "device_id", info.DeviceID)
 	}
+
+	signer := sign.PlayerSigner{}
+	proto := hgproto.NewClient(signer, hgproto.Device{
+		DeviceID:        info.DeviceID,
+		IID:             info.IID,
+		CDID:            info.CDID,
+		VersionCode:     "74332",
+		VersionName:     "7.4.3.32",
+		ManifestVersion: "74332",
+		UpdateVersion:   "74332",
+		PVPlayer:        "74332",
+	})
+
+	svc := server.New(server.Config{
+		Version:       version,
+		SessionToken:  randomToken(),
+		Logger:        logger,
+		ArchiveDir:    dirs.Data,
+		Proto:         proto,
+		MediaProxy:    media.NewProxy(streamResolver{proto: proto}),
+		MediaProvider: localMediaProvider,
+	}, signer)
 
 	return &app{dirs: dirs, logger: logger, svc: svc}, nil
 }
 
+// streamResolver 把协议层取址适配为媒体代理需要的解析器。
+type streamResolver struct {
+	proto *hgproto.Client
+}
+
+// ResolveStream 解析分集标识到片源。
+func (s streamResolver) ResolveStream(ctx context.Context, vid string) (media.StreamSource, error) {
+	info, err := s.proto.Play(ctx, vid)
+	if err != nil {
+		return media.StreamSource{}, err
+	}
+	return media.StreamSource{
+		URL:        info.URL,
+		Encrypted:  info.Encrypted,
+		ContentKey: info.ContentKey,
+	}, nil
+}
+
 // assetHandler 组装前端静态资源 + 同源 /api、/media 的 Handler。
+//
+// 壳页面（/ 与 /index.html）由静态资源处理器直接返回，不经过后端中间件，
+// 因此在服务壳页面时显式下发本地会话 Cookie。
 func (a *app) assetHandler() http.Handler {
 	static := application.AssetFileServerFS(frontendAssets)
+
+	shell := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			a.svc.SetSessionCookie(w)
+		}
+		static.ServeHTTP(w, r)
+	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", a.svc.Handler())
 	mux.Handle("/media/", a.svc.Handler())
-	mux.Handle("/", static)
+	mux.Handle("/", shell)
 	return mux
 }
 

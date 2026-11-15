@@ -78,9 +78,9 @@ func (c *Client) BrowseList(ctx context.Context, category string, genre string, 
 
 // BrowseResult 是目录浏览结果。
 type BrowseResult struct {
-	Results []SeriesCard
-	Page    int
-	HasMore bool
+	Results []SeriesCard `json:"results"`
+	Page    int          `json:"page"`
+	HasMore bool         `json:"hasMore"`
 }
 
 // SeriesCard 是目录中的短剧卡片。
@@ -200,8 +200,8 @@ func (c *Client) Search(ctx context.Context, keyword string, page int) (*SearchR
 
 // SearchResult 是搜索结果。
 type SearchResult struct {
-	Results []SeriesCard
-	Page    int
+	Results []SeriesCard `json:"results"`
+	Page    int          `json:"page"`
 }
 
 // parseSearchPayload 解析搜索响应。

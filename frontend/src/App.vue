@@ -1,182 +1,415 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
-import { account, archive, refreshAccount, login, logout, loadArchive } from './store/account';
-import { ApiException } from './api/client';
+import { ref, computed, onMounted } from 'vue';
+import {
+  api,
+  ApiException,
+  type SeriesCard,
+  type SeriesDetail,
+  type EpisodeBrief,
+} from './api/client';
 
-// 版本信息
+// —— 视图状态 ——
+type View = 'catalog' | 'search' | 'series' | 'player';
+const view = ref<View>('catalog');
+
+// —— 全局 ——
 const version = ref('');
 const versionError = ref('');
+const notice = ref('');
 
-// 媒体播放：使用同源 /media/{id} 相对路径，验证 Range 与拖拽 seek
-const mediaId = ref('sample.mp4');
-const mediaUrl = computed(() => `/media/${mediaId.value}`);
-const videoEl = ref<HTMLVideoElement | null>(null);
-const seekInfo = ref('未请求');
+// —— 账号 ——
+const account = ref({ logged_in: false, account_id: '', display_name: '' });
+const loginForm = ref({ id: '', name: '' });
+const showLogin = ref(false);
 
-// 登录表单
-const loginId = ref('');
-const loginName = ref('');
-const loginError = ref('');
-const loginBusy = ref(false);
+// —— 目录 ——
+const categories = [
+  { key: 'real-drama', label: '真人短剧' },
+  { key: 'ai-drama', label: 'AI 短剧' },
+  { key: 'hot-drama', label: '热播榜' },
+  { key: 'comic', label: '漫剧' },
+];
+const category = ref('real-drama');
+const cards = ref<SeriesCard[]>([]);
+const page = ref(1);
+const hasMore = ref(false);
+const loading = ref(false);
 
-// 401 拦截：区分本地会话与账号凭证
-const sessionNotice = ref('');
+// —— 搜索 ——
+const keyword = ref('');
+const searchResults = ref<SeriesCard[]>([]);
+const recentSearches = ref<string[]>([]);
+const searched = ref(false);
 
+// —— 详情与播放 ——
+const series = ref<SeriesDetail | null>(null);
+const currentEpisode = ref<EpisodeBrief | null>(null);
+const videoSrc = ref('');
+const playError = ref('');
+
+// —— 初始化 ——
 onMounted(async () => {
-  await Promise.all([
-    loadVersion(),
-    refreshAccount(),
-    loadArchive(),
-  ]);
+  await Promise.all([loadVersion(), loadAccount(), loadRecentSearches(), loadCatalog(true)]);
 });
 
 async function loadVersion() {
   try {
-    const res = await fetch('/api/system/version');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    version.value = (await res.json()).version;
+    const res = await api.version();
+    version.value = res.version;
   } catch (err) {
-    versionError.value = String(err);
+    versionError.value = err instanceof ApiException ? err.message : String(err);
   }
 }
 
-// 401 拦截器：统一处理两类语义
-function handleAuthError(err: unknown): void {
-  if (err instanceof ApiException) {
-    if (err.isLocalSession) {
-      sessionNotice.value = '本地会话未建立，请刷新页面重试';
-    } else if (err.isAccountToken) {
-      sessionNotice.value = '账号凭证已过期，请重新登录';
-      account.loggedIn = false;
-    }
-  }
-}
-
-async function onLogin() {
-  loginBusy.value = true;
-  loginError.value = '';
-  sessionNotice.value = '';
+async function loadAccount() {
   try {
-    await login(loginId.value.trim(), loginName.value.trim());
-  } catch (err) {
-    if (err instanceof ApiException) {
-      handleAuthError(err);
-      loginError.value = err.message;
-    } else {
-      loginError.value = String(err);
+    account.value = await api.account();
+  } catch {
+    account.value = { logged_in: false, account_id: '', display_name: '' };
+  }
+}
+
+async function loadRecentSearches() {
+  try {
+    recentSearches.value = (await api.searchHistory()).history ?? [];
+  } catch {
+    recentSearches.value = [];
+  }
+}
+
+// —— 目录 ——
+async function loadCatalog(reset = false) {
+  if (loading.value) return;
+  loading.value = true;
+  notice.value = '';
+  try {
+    if (reset) {
+      page.value = 1;
+      cards.value = [];
     }
+    const res = await api.catalog(category.value, '', page.value);
+    cards.value = reset ? res.results : [...cards.value, ...res.results];
+    hasMore.value = res.hasMore;
+  } catch (err) {
+    notice.value = err instanceof ApiException ? err.message : String(err);
   } finally {
-    loginBusy.value = false;
+    loading.value = false;
   }
 }
 
-async function onLogout() {
+function switchCategory(key: string) {
+  if (category.value === key) return;
+  category.value = key;
+  loadCatalog(true);
+}
+
+function loadMore() {
+  if (!hasMore.value || loading.value) return;
+  page.value += 1;
+  loadCatalog(false);
+}
+
+// —— 搜索 ——
+async function doSearch() {
+  const q = keyword.value.trim();
+  if (!q) return;
+  view.value = 'search';
+  loading.value = true;
+  notice.value = '';
   try {
-    await logout();
+    const res = await api.search(q, 1);
+    searchResults.value = res.results;
+    searched.value = true;
+    recentSearches.value = (await api.searchHistory()).history ?? [];
   } catch (err) {
-    handleAuthError(err);
+    notice.value = err instanceof ApiException ? err.message : String(err);
+    searchResults.value = [];
+  } finally {
+    loading.value = false;
   }
 }
 
-// 监听 range 请求，确认 206 语义生效
-function onLoadStart() {
-  seekInfo.value = '开始加载（Range 请求）';
+async function useRecent(q: string) {
+  keyword.value = q;
+  await doSearch();
 }
-function onSeeked() {
-  seekInfo.value = `已 seek 至 ${videoEl.value?.currentTime.toFixed(2)}s`;
-}
-function onProgress() {
-  if (videoEl.value && !videoEl.value.seeking) {
-    seekInfo.value = `已缓冲 ${Math.round(videoEl.value.buffered.length ? videoEl.value.buffered.end(videoEl.value.buffered.length - 1) : 0)}s`;
+
+async function clearRecent() {
+  try {
+    recentSearches.value = (await api.updateSearchHistory('clear', '')).history ?? [];
+  } catch {
+    /* 忽略 */
   }
 }
+
+// —— 详情 ——
+async function openSeries(id: string) {
+  view.value = 'series';
+  series.value = null;
+  notice.value = '';
+  try {
+    series.value = await api.series(id);
+  } catch (err) {
+    notice.value = err instanceof ApiException ? err.message : String(err);
+  }
+}
+
+async function toggleFavorite() {
+  if (!series.value) return;
+  try {
+    const res = await api.toggleFavorite({
+      series_id: series.value.series_id,
+      series_title: series.value.series_title,
+      cover: series.value.cover,
+    });
+    series.value.is_favorite = res.favorited;
+  } catch (err) {
+    notice.value = err instanceof ApiException ? err.message : String(err);
+  }
+}
+
+// —— 播放 ——
+async function playEpisode(ep: EpisodeBrief) {
+  if (!series.value) return;
+  view.value = 'player';
+  currentEpisode.value = ep;
+  videoSrc.value = '';
+  playError.value = '';
+  try {
+    const info = await api.play(ep.vid);
+    if (info.encrypted) {
+      playError.value = '该片源受 CENC 保护，需要解密管线；当前仅支持未加密片源。';
+      return;
+    }
+    videoSrc.value = `/media/${encodeURIComponent(ep.vid)}`;
+  } catch (err) {
+    playError.value = err instanceof ApiException ? err.message : String(err);
+  }
+}
+
+let lastSaved = 0;
+async function onTimeUpdate(e: Event) {
+  const el = e.target as HTMLVideoElement;
+  if (!series.value || !currentEpisode.value) return;
+  const now = Date.now();
+  if (now - lastSaved < 5000) return;
+  lastSaved = now;
+  try {
+    await api.saveProgress({
+      series_id: series.value.series_id,
+      series_title: series.value.series_title,
+      cover: series.value.cover,
+      episode_index: currentEpisode.value.episode_index,
+      position_sec: Math.floor(el.currentTime),
+      duration_sec: Math.floor(el.duration || 0),
+    });
+  } catch {
+    /* 进度保存失败不影响播放 */
+  }
+}
+
+// —— 账号操作 ——
+async function doLogin() {
+  notice.value = '';
+  try {
+    await api.login(loginForm.value.id.trim(), loginForm.value.name.trim());
+    await loadAccount();
+    showLogin.value = false;
+  } catch (err) {
+    notice.value = err instanceof ApiException ? err.message : String(err);
+  }
+}
+
+async function doLogout() {
+  try {
+    await api.logout();
+    await loadAccount();
+  } catch (err) {
+    notice.value = err instanceof ApiException ? err.message : String(err);
+  }
+}
+
+const episodeCount = computed(() => series.value?.episodes.length ?? 0);
 </script>
 
 <template>
   <div class="page">
     <header class="topbar">
-      <div class="brand">红果短剧 <span class="tag">Go / Wails</span></div>
+      <div class="brand" @click="view = 'catalog'">红果短剧 <span class="tag">Go / Wails</span></div>
+
+      <div class="searchbar">
+        <input
+          v-model="keyword"
+          class="input"
+          placeholder="搜索剧名 / 演员 / 题材"
+          @keyup.enter="doSearch"
+        />
+        <button class="btn primary" @click="doSearch">搜索</button>
+      </div>
+
       <div class="topbar-right">
-        <div class="version">
-          版本：<code>{{ version || '加载中…' }}</code>
-          <span v-if="versionError" class="err">{{ versionError }}</span>
-        </div>
-        <div class="account">
-          <template v-if="account.loggedIn">
-            <span class="who">{{ account.displayName }}（{{ account.accountId }}）</span>
-            <button class="btn" @click="onLogout">登出</button>
-          </template>
-          <template v-else>
-            <span class="who muted">未登录</span>
-          </template>
-        </div>
+        <span class="version">v{{ version || '…' }}<span v-if="versionError" class="err"> {{ versionError }}</span></span>
+        <template v-if="account.logged_in">
+          <span class="who">{{ account.display_name || account.account_id }}</span>
+          <button class="btn" @click="doLogout">登出</button>
+        </template>
+        <button v-else class="btn" @click="showLogin = !showLogin">登录</button>
       </div>
     </header>
 
-    <div v-if="sessionNotice" class="notice">{{ sessionNotice }}</div>
+    <div v-if="showLogin && !account.logged_in" class="loginbar">
+      <input v-model="loginForm.id" class="input" placeholder="账号标识" />
+      <input v-model="loginForm.name" class="input" placeholder="展示名称" />
+      <button class="btn primary" @click="doLogin">登录</button>
+    </div>
 
-    <main class="stage">
-      <div class="video-wrap">
-        <video
-          ref="videoEl"
-          :src="mediaUrl"
-          class="video"
-          controls
-          playsinline
-          preload="metadata"
-          @loadstart="onLoadStart"
-          @seeked="onSeeked"
-          @progress="onProgress"
-        />
-        <div class="seek-status">{{ seekInfo }}</div>
+    <div v-if="notice" class="notice">{{ notice }}</div>
 
-        <section class="panel">
-          <h2>登录</h2>
-          <p class="hint">登录为可选增强；本地档案包不依赖账号，登录与否都可用。</p>
-          <div class="row">
-            <input v-model="loginId" class="input" placeholder="账号标识" />
-            <input v-model="loginName" class="input" placeholder="展示名称" />
-            <button class="btn primary" :disabled="loginBusy" @click="onLogin">
-              {{ loginBusy ? '登录中…' : '登录' }}
-            </button>
+    <!-- 目录页 -->
+    <main v-if="view === 'catalog'" class="content">
+      <nav class="tabs">
+        <button
+          v-for="c in categories"
+          :key="c.key"
+          class="tab"
+          :class="{ active: category === c.key }"
+          @click="switchCategory(c.key)"
+        >
+          {{ c.label }}
+        </button>
+      </nav>
+
+      <div v-if="loading && cards.length === 0" class="muted">加载中…</div>
+      <div v-else-if="cards.length === 0" class="muted">暂无内容</div>
+
+      <div class="grid">
+        <article v-for="card in cards" :key="card.series_id" class="card" @click="openSeries(card.series_id)">
+          <img v-if="card.cover" :src="card.cover" class="cover" :alt="card.series_title" />
+          <div v-else class="cover placeholder">无封面</div>
+          <div class="card-body">
+            <h3>{{ card.series_title }}</h3>
+            <p class="muted small">{{ card.episode_count }} 集</p>
+            <p v-if="card.tags.length" class="tags">
+              <span v-for="t in card.tags" :key="t" class="tag-chip">{{ t }}</span>
+            </p>
           </div>
-          <p v-if="loginError" class="err">{{ loginError }}</p>
-        </section>
-
-        <section class="panel">
-          <h2>本地档案包</h2>
-          <p v-if="archive.error" class="err">{{ archive.error }}</p>
-          <p v-else-if="!archive.loaded" class="muted">加载中…</p>
-          <template v-else>
-            <h3>观看历史（{{ archive.history.length }}）</h3>
-            <ul class="list">
-              <li v-for="item in archive.history" :key="item.series_id">
-                {{ item.series_title || item.series_id }} · 第 {{ item.episode_index }} 集 · {{ item.position_sec.toFixed(0) }}s
-              </li>
-              <li v-if="archive.history.length === 0" class="muted">暂无</li>
-            </ul>
-            <h3>收藏（{{ archive.favorites.length }}）</h3>
-            <ul class="list">
-              <li v-for="item in archive.favorites" :key="item.series_id">
-                {{ item.series_title || item.series_id }}
-              </li>
-              <li v-if="archive.favorites.length === 0" class="muted">暂无</li>
-            </ul>
-          </template>
-        </section>
+        </article>
       </div>
 
-      <aside class="side">
-        <h2>验证项</h2>
-        <ul class="checks">
-          <li>同源 <code>/api/system/version</code></li>
-          <li>同源 <code>/media/{id}</code> 流式</li>
-          <li>Range → 206 + Content-Range</li>
-          <li><code>&lt;video&gt;</code> 拖拽 seek</li>
-          <li>登录 / 登出 + 缓存失效</li>
-          <li>两类 401 语义分离</li>
-          <li>已消除 <code>unsafe-eval</code></li>
-        </ul>
+      <div v-if="hasMore" class="more">
+        <button class="btn" :disabled="loading" @click="loadMore">
+          {{ loading ? '加载中…' : '加载更多' }}
+        </button>
+      </div>
+    </main>
+
+    <!-- 搜索页 -->
+    <main v-else-if="view === 'search'" class="content">
+      <section v-if="recentSearches.length" class="recent">
+        <div class="recent-head">
+          <span class="muted small">最近搜索</span>
+          <button class="link" @click="clearRecent">清空</button>
+        </div>
+        <div class="chips">
+          <button v-for="q in recentSearches" :key="q" class="chip" @click="useRecent(q)">{{ q }}</button>
+        </div>
+      </section>
+
+      <div v-if="loading" class="muted">搜索中…</div>
+      <div v-else-if="searched && searchResults.length === 0" class="muted">没有找到相关剧集</div>
+
+      <div class="grid">
+        <article v-for="card in searchResults" :key="card.series_id" class="card" @click="openSeries(card.series_id)">
+          <img v-if="card.cover" :src="card.cover" class="cover" :alt="card.series_title" />
+          <div v-else class="cover placeholder">无封面</div>
+          <div class="card-body">
+            <h3>{{ card.series_title }}</h3>
+            <p class="muted small">{{ card.episode_count }} 集</p>
+          </div>
+        </article>
+      </div>
+    </main>
+
+    <!-- 详情页 -->
+    <main v-else-if="view === 'series'" class="content">
+      <div v-if="!series" class="muted">加载中…</div>
+      <template v-else>
+        <section class="detail">
+          <img v-if="series.cover" :src="series.cover" class="detail-cover" :alt="series.series_title" />
+          <div class="detail-body">
+            <h2>{{ series.series_title }}</h2>
+            <p class="muted small">{{ episodeCount }} 集</p>
+            <p class="desc">{{ series.description }}</p>
+            <div class="actions">
+              <button class="btn" @click="toggleFavorite">
+                {{ series.is_favorite ? '★ 已收藏' : '☆ 收藏' }}
+              </button>
+              <button
+                v-if="series.episodes.length"
+                class="btn primary"
+                @click="playEpisode(series.episodes[0])"
+              >
+                {{ series.saved_progress ? '继续播放' : '开始播放' }}
+              </button>
+            </div>
+            <p v-if="series.saved_progress" class="muted small">
+              上次看到第 {{ series.saved_progress.episode_index }} 集 {{ series.saved_progress.position_sec }}s
+            </p>
+          </div>
+        </section>
+
+        <h3 class="section-title">选集</h3>
+        <div class="episodes">
+          <button
+            v-for="ep in series.episodes"
+            :key="ep.vid"
+            class="episode"
+            :class="{ current: currentEpisode?.vid === ep.vid }"
+            @click="playEpisode(ep)"
+          >
+            {{ ep.episode_index }}
+          </button>
+        </div>
+      </template>
+    </main>
+
+    <!-- 播放页 -->
+    <main v-else class="content player">
+      <div class="video-wrap">
+        <video
+          v-if="videoSrc"
+          :src="videoSrc"
+          class="video"
+          controls
+          autoplay
+          playsinline
+          @timeupdate="onTimeUpdate"
+        />
+        <div v-else class="video placeholder-video">
+          <span>{{ playError || '未选择分集' }}</span>
+        </div>
+        <div v-if="playError && videoSrc" class="err">{{ playError }}</div>
+        <div class="play-meta">
+          <strong>{{ series?.series_title }}</strong>
+          <span v-if="currentEpisode" class="muted">
+            第 {{ currentEpisode.episode_index }} 集
+          </span>
+        </div>
+      </div>
+
+      <aside class="episode-side">
+        <h3>选集</h3>
+        <div class="episodes">
+          <button
+            v-for="ep in series?.episodes ?? []"
+            :key="ep.vid"
+            class="episode"
+            :class="{ current: currentEpisode?.vid === ep.vid }"
+            @click="playEpisode(ep)"
+          >
+            {{ ep.episode_index }}
+          </button>
+        </div>
       </aside>
     </main>
   </div>

@@ -11,11 +11,14 @@ import (
 	"hgplayer/internal/account"
 	"hgplayer/internal/archive"
 	"hgplayer/internal/cache"
+	"hgplayer/internal/hgproto"
 	"hgplayer/internal/logx"
+	"hgplayer/internal/media"
 	"hgplayer/internal/sign"
 )
 
-// Server 是应用的 HTTP 服务，持有配置、签名器、日志器、会话、档案包与缓存。
+// Server 是应用的 HTTP 服务，持有配置、签名器、协议客户端、日志器、
+// 会话、档案包与缓存。
 type Server struct {
 	cfg     Config
 	signer  sign.Signer
@@ -23,6 +26,8 @@ type Server struct {
 	account *account.Manager
 	archive *archive.Store
 	cache   *cache.Store
+	proto   *hgproto.Client
+	media   *media.Proxy
 }
 
 // New 创建服务实例。logger/account/archive 为空时使用默认实例。
@@ -39,7 +44,16 @@ func New(cfg Config, signer sign.Signer) *Server {
 	if st == nil {
 		st, _ = archive.New(cfg.ArchiveDir)
 	}
-	return &Server{cfg: cfg, signer: signer, logger: l, account: mgr, archive: st, cache: cache.New()}
+	return &Server{
+		cfg:     cfg,
+		signer:  signer,
+		logger:  l,
+		account: mgr,
+		archive: st,
+		cache:   cache.New(),
+		proto:   cfg.Proto,
+		media:   cfg.MediaProxy,
+	}
 }
 
 // Handler 返回完整的应用 HTTP 路由。
@@ -60,8 +74,18 @@ func (s *Server) Handler() http.Handler {
 	// —— 本地档案包 ——
 	mux.HandleFunc("GET /api/archive/history", s.handleArchiveHistory)
 	mux.HandleFunc("GET /api/archive/favorites", s.handleArchiveFavorites)
+	mux.HandleFunc("POST /api/archive/progress", s.handleArchiveSaveProgress)
+	mux.HandleFunc("POST /api/archive/favorites/toggle", s.handleArchiveToggleFavorite)
+	mux.HandleFunc("GET /api/archive/search-history", s.handleArchiveSearchHistory)
+	mux.HandleFunc("POST /api/archive/search-history", s.handleArchiveUpdateSearchHistory)
 
-	// —— 媒体代理（伪 CDN）——
+	// —— 红果协议（目录 / 搜索 / 详情 / 取址）——
+	mux.HandleFunc("GET /api/catalog", s.handleCatalog)
+	mux.HandleFunc("GET /api/search", s.handleSearch)
+	mux.HandleFunc("GET /api/series/{id}", s.handleSeries)
+	mux.HandleFunc("GET /api/play/{vid}", s.handlePlay)
+
+	// —— 媒体代理 ——
 	mux.HandleFunc("GET /media/{id}", s.handleMedia)
 
 	return s.chain(mux)
@@ -70,6 +94,23 @@ func (s *Server) Handler() http.Handler {
 // chain 组装中间件链。顺序：访问日志 → 本地会话 → 错误包装。
 func (s *Server) chain(next http.Handler) http.Handler {
 	return s.errorWrap(s.sessionGuard(s.logAccess(next)))
+}
+
+// SetSessionCookie 在应用壳响应上下发本地会话 Cookie。
+//
+// /index.html 由 Wails 静态资源处理器直接返回，不经过本服务的中间件，
+// 因此由调用方（assetHandler）在服务壳页面时显式调用本方法。
+func (s *Server) SetSessionCookie(w http.ResponseWriter) {
+	if s.cfg.SessionToken == "" {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    s.cfg.SessionToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
 }
 
 // writeJSON 以 JSON 写出响应。
