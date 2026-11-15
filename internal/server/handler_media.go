@@ -46,7 +46,11 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 回退：本地媒体文件（用于测试与离线样本）。
+	// 回退：本地媒体文件（测试注入的 provider）。
+	if s.cfg.MediaProvider == nil {
+		writeJSON(w, http.StatusNotFound, mediaError{Error: "媒体不存在"})
+		return
+	}
 	total, src, err := s.cfg.MediaProvider(id)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, mediaError{Error: "媒体不存在"})

@@ -298,8 +298,15 @@ func decodeContentKey(value string) ([]byte, error) {
 // （稳定标识分集文件）与内容密钥；密钥或文件变了才算另一份片源。
 func mediaFingerprint(rawURL, key string) string {
 	stable := rawURL
-	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
-		stable = u.Host + u.Path
+	if u, err := url.Parse(rawURL); err == nil {
+		// 主机与路径前段都是每次取址轮换的 CDN/令牌，最后一段才是文件标识。
+		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+		for i := len(segments) - 1; i >= 0; i-- {
+			if segments[i] != "" {
+				stable = segments[i]
+				break
+			}
+		}
 	}
 	sum := sha256.Sum256([]byte(stable + "\x00" + key))
 	return hex.EncodeToString(sum[:8])

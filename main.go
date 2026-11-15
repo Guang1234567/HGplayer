@@ -123,13 +123,12 @@ func newApp() (*app, error) {
 	)
 
 	svc := server.New(server.Config{
-		Version:       version,
-		SessionToken:  randomToken(),
-		Logger:        logger,
-		ArchiveDir:    dirs.Data,
-		Proto:         proto,
-		MediaProxy:    media.NewProxy(streamResolver{proto: proto}),
-		MediaProvider: localMediaProvider,
+		Version:      version,
+		SessionToken: randomToken(),
+		Logger:       logger,
+		ArchiveDir:   dirs.Data,
+		Proto:        proto,
+		MediaProxy:   media.NewProxy(streamResolver{proto: proto}),
 	}, signer)
 
 	return &app{dirs: dirs, logger: logger, svc: svc}, nil
