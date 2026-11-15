@@ -31,6 +31,8 @@ type Client struct {
 	searchAPI        string
 	// mdHost 是目录 / 详情类接口的域名。
 	mdHost string
+	// playbackAPI 是取址接口（video_model）。
+	playbackAPI string
 	// websiteAPI 是官网搜索接口。
 	websiteAPI string
 	// siteOrigin 是官网站点根地址（页面与接口同源）。
@@ -55,6 +57,7 @@ func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	c.shortPlayAPI = ShortPlayAPI
 	c.searchAPI = SearchAPI
 	c.mdHost = metadataHost
+	c.playbackAPI = playbackHost + playbackPath
 	c.websiteAPI = websiteSearchAPI
 	c.siteOrigin = websiteOrigin
 

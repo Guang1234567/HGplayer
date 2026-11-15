@@ -115,6 +115,8 @@ func newApp() (*app, error) {
 		ManifestVersion: "74332",
 		UpdateVersion:   "74332",
 		PVPlayer:        "74332",
+		OpenUDID:        info.OpenUDID,
+		TTReq:           info.TTReq,
 	})
 
 	svc := server.New(server.Config{

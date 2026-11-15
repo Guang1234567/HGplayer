@@ -16,6 +16,10 @@ type Info struct {
 	IID      string `json:"iid"`
 	Cookie   string `json:"cookie,omitempty"`
 	CDID     string `json:"cdid,omitempty"`
+	// OpenUDID 是上游要求的设备指纹字段（取址查询串的一部分）。
+	OpenUDID string `json:"openudid,omitempty"`
+	// TTReq 是设备注册下发的会话标记（取址 cookie 携带）。
+	TTReq string `json:"ttreq,omitempty"`
 }
 
 // fileName 是设备身份持久化文件名。

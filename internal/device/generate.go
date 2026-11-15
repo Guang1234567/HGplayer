@@ -15,6 +15,7 @@ func Generate() Info {
 		DeviceID: randomDigits(16),
 		IID:      randomDigits(16),
 		CDID:     randomUUID(),
+		OpenUDID: randomHex(8),
 	}
 }
 
@@ -35,6 +36,15 @@ func randomDigits(n int) string {
 		out[i] = byte('0' + lo + v.Int64())
 	}
 	return string(out)
+}
+
+// randomHex 生成 n 字节的十六进制串。
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // randomUUID 生成 v4 风格 UUID 字符串。

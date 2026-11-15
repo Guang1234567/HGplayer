@@ -52,293 +52,170 @@ var playDigitPattern = regexp.MustCompile(`\d+`)
 
 // Play 获取单集播放地址与解密参数。
 //
-// 移植自 hongguo-open-player/src/server/native/app-source.js（GPL-3.0-only）的
-// playbackRequest / shortplayRequest / parseFallback / parseEntryPlayInfo / fetchAppPlayUrl。
-// 取址失败时按「主接口 → 备用接口 → 短剧接口」逐级兜底，
-// HTTP 200 但响应体为空同样视为失败（对齐源实现 fetchAppPlayUrl）。
+// 移植自 beilunyang/openhongguo（Apache-2.0）的在役取址实现：
+// 请求 /novel/player/video_model/v1/，body 为 {video_id, biz_param}，
+// 并用真实 Argus 551 / Ladon 签名（不带 x-medusa）。
 //
-// 已知限制：本机对真实 App 取址端点（reading.snssdk.com 等）返回 HTTP 200 + 0 字节，
-// 参考实现同样如此，因此这条链路无法做真实端到端验证；只能逐行对齐源实现，
-// 并用本地 httptest 固定住请求形状、兜底顺序与解析规则。
-//
-// 未移植的源实现能力：entryCache（分集条目缓存）、nextVids 批量取址、清晰度选项
-// （requestedQuality 固定为 auto，allowLowerQuality 为 false）、ByteVC2 转码
-// （allowBytevc2 固定为 false）、12s 截止时间（由 ctx 与上游客户端超时承担）。
+// 已知限制：响应是 CENC 保护的 H.265 片源，前端需要解密管线才能播放。
 func (c *Client) Play(ctx context.Context, vid string) (*PlayInfo, error) {
 	if !numericID.MatchString(vid) {
 		return nil, inputErrf("分集编号无效")
 	}
 
-	response, err := c.fetchPlayResponse(ctx, vid)
+	target, headers, body := c.playbackSigned(vid)
+	response, err := c.doJSONRaw(ctx, http.MethodPost, target, body, headers)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("App 取址不可用：%v", err)
 	}
-	if codeOf(response) != 0 {
+	if code := codeOf(response); code != 0 {
 		return nil, fmt.Errorf("App 接口暂未提供本集播放信息")
 	}
 
 	data, _ := response["data"].(map[string]any)
-	entry, _ := data[vid].(map[string]any)
-	if entry == nil {
-		return nil, fmt.Errorf("App 接口未返回所选分集，已停止取址")
+	model := data["video_model"]
+	if model == nil {
+		return nil, fmt.Errorf("App 接口未返回本集片源模型")
 	}
-	return c.parseEntryPlayInfo(ctx, vid, entry)
+	// 复用解析链路：把模型包成带 video_model 的分集条目。
+	return c.parseEntryPlayInfo(ctx, vid, map[string]any{"video_model": model})
 }
 
-// fetchPlayResponse 按 主接口 → 备用接口 → 短剧接口 的顺序取址。
+// 取址走独立签名：真实 Argus 551 / Ladon 信封，且不带 x-medusa。
 //
-// 源实现仅在主接口返回空响应（EMPTY_RESPONSE）时尝试备用接口，
-// 其他网络错误直接跳到短剧接口；这里统一成逐级兜底，语义等价且更简单。
-func (c *Client) fetchPlayResponse(ctx context.Context, vid string) (map[string]any, error) {
-	payload := buildPlaybackPayload(vid)
+// 2026-11-10 起取址接口（/novel/player/video_model/v1/）只接受真实信封：
+// 4 字节时间戳桩、或与 551 信封同时出现的 x-medusa，都会被回以
+// HTTP 200 + 空响应体。目录 / 详情 / 搜索等读接口仍沿用桩签名与 medusa。
+const (
+	// playbackHost 是取址接口域名（在役客户端的所有 /novel/ 请求都发到这里）。
+	playbackHost = "https://api5-normal-sinfonlinea.fqnovel.com"
+	// playbackPath 是取址接口路径。
+	playbackPath = "/novel/player/video_model/v1/"
+	// 取址请求声明的客户端版本（与在役客户端一致）。
+	playbackVersionCode = "73932"
+	playbackVersionName = "7.3.9.32"
+	// playbackAID 是红果 App 的 aid。
+	playbackAID = "8662"
+	// playbackBranch 是取址请求要求命中的 f13 分支。
+	playbackBranch = 1
+)
 
-	var firstErr error
-	for _, endpoint := range []string{c.videoAPI, c.videoAPIFallback} {
-		if endpoint == "" {
-			continue
-		}
-		response, err := c.playbackRequest(ctx, endpoint, payload)
-		if err == nil {
-			return response, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	// 终极降级：番茄小说客户端短剧接口（aid=1967），沿用同一设备身份。
-	shortErr := errors.New("短剧接口未返回所选分集")
-	if short, err := c.shortplayRequest(ctx, vid); err != nil {
-		shortErr = err
-	} else if entry := shortplayEntry(short, vid); entry != nil {
-		return map[string]any{"code": 0, "data": map[string]any{vid: entry}}, nil
-	}
-
-	if firstErr == nil {
-		firstErr = errors.New("主接口未返回可用响应")
-	}
-	return nil, fmt.Errorf("App 取址不可用：主接口 %v；短剧接口 %v", firstErr, shortErr)
-}
-
-// playbackRequest 请求播放取址接口并解析 JSON 响应。
-func (c *Client) playbackRequest(ctx context.Context, endpoint string, payload []byte) (map[string]any, error) {
-	target, headers, body := c.playbackSigned(endpoint, payload)
-	return c.doJSONRaw(ctx, http.MethodPost, target, body, headers)
-}
-
-// playbackSigned 构造播放取址请求：URL、请求头与 gzip 压缩后的请求体。
+// playbackPayload 是取址请求体。
+// buildPlaybackBody 构造取址请求体。
 //
-// 头部必须在此自行组装并经 c.upRaw 发出：upstream.Client.Do 注入签名时，
-// sign.PlayerSigner 会用 url.Values.Encode 重写 query（改为字典序、空格编码为 '+'），
-// 而播放签名对 query 字节级敏感，被改写后的签名输入与源实现
-// （app-source.js playbackRequest + argus.js PlayerSigner.headers）不再一致。
-// 这里把原始 query 直接交给签名器，且 DeviceID/IID 留空（query 中已含设备身份），
-// 保证签名作用于实际发送的 gzip 字节与 query。
-func (c *Client) playbackSigned(endpoint string, payload []byte) (string, map[string]string, []byte) {
-	body := gzipBytes(payload)
-	ticket := strconv.FormatInt(time.Now().UnixMilli(), 10)
-
-	pairs := append(c.playbackDeviceOrdered(), kv{"_rticket", ticket})
-	query := encodeOrderedQuery(pairs)
-	target := endpoint + "?" + query
-
-	headers := map[string]string{
-		"User-Agent":           playbackUA,
-		"Accept":               "application/json; charset=utf-8,application/x-protobuf",
-		"Content-Type":         "application/json; charset=UTF-8",
-		"Content-Encoding":     "gzip",
-		"sdk-version":          "2",
-		"passport-sdk-version": "5051452",
-		"x-xs-from-web":        "0",
-		"x-ss-dp":              "8662",
-	}
-	if c.device.IID != "" {
-		headers["Cookie"] = "store-region=cn-bj; store-region-src=did; install_id=" + c.device.IID
-	}
-	for key, value := range c.signPlayback(target, query, body) {
-		headers[key] = value
-	}
-	return target, headers, body
-}
-
-// signPlayback 用播放器签名器为 query 与实际发送的 body 生成鉴权头。
-func (c *Client) signPlayback(target, query string, body []byte) map[string]string {
-	if c.signer == nil {
-		return nil
-	}
-	return c.signer.Sign(sign.Signature{
-		Method: http.MethodPost,
-		URL:    target,
-		Query:  query,
-		Body:   body,
-	})
-}
-
-// playbackDeviceOrdered 返回播放请求的设备参数（插入序，对齐源实现的 PLAYBACK_DEVICE）。
-func (c *Client) playbackDeviceOrdered() []kv {
-	return []kv{
-		{"ac", "wifi"},
-		{"channel", "update_64"},
-		{"aid", "8662"},
-		{"app_name", "novelread"},
-		{"version_code", orDefault(c.device.VersionCode, "74332")},
-		{"version_name", orDefault(c.device.VersionName, "7.4.3.32")},
-		{"device_platform", "android"},
-		{"os", "android"},
-		{"ssmix", "a"},
-		{"device_type", "25053RT47C"},
-		{"device_brand", "Redmi"},
-		{"language", "zh"},
-		{"os_api", "36"},
-		{"os_version", "16"},
-		{"manifest_version_code", orDefault(c.device.ManifestVersion, "74332")},
-		{"resolution", "1280*2772"},
-		{"dpi", "520"},
-		{"update_version_code", orDefault(c.device.UpdateVersion, "74332")},
-		{"host_abi", "arm64-v8a"},
-		{"dragon_device_type", "phone"},
-		{"pv_player", orDefault(c.device.PVPlayer, "74332")},
-		{"compliance_status", "0"},
-		{"need_personal_recommend", "1"},
-		{"player_so_load", "1"},
-		{"is_android_pad_screen", "0"},
-		{"device_id", c.device.DeviceID},
-		{"iid", c.device.IID},
-		{"cdid", c.device.CDID},
-	}
-}
-
-// orDefault 在值为空时回退到默认值。
-func orDefault(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
-// playbackPayload 是播放取址请求体。
-//
-// 字段顺序与源实现一致：请求体参与签名，字节顺序敏感。
-type playbackPayload struct {
-	DrScene         string              `json:"dr_scene"`
-	BizParam        playbackBizParam    `json:"biz_param"`
-	MixedVideoIDMap map[string][]string `json:"mixed_video_id_map"`
-}
-
-// playbackBizParam 是播放取址请求的业务参数。
-type playbackBizParam struct {
-	DetailPageVersion      int  `json:"detail_page_version"`
-	DeviceLevel            int  `json:"device_level"`
-	DisableDiggStat        bool `json:"disable_digg_stat"`
-	NeedAllVideoDefinition bool `json:"need_all_video_definition"`
-	NeedMP4Align           bool `json:"need_mp4_align"`
-	UseOSPlayer            bool `json:"use_os_player"`
-	UseServerDNS           bool `json:"use_server_dns"`
-	VideoPlatform          int  `json:"video_platform"`
-}
-
-// buildPlaybackPayload 构造播放取址请求体。
-func buildPlaybackPayload(vid string) []byte {
-	body, _ := json.Marshal(playbackPayload{
-		DrScene: "player",
-		BizParam: playbackBizParam{
-			DetailPageVersion:      0,
-			DeviceLevel:            3,
-			DisableDiggStat:        false,
-			NeedAllVideoDefinition: true,
-			NeedMP4Align:           false,
-			UseOSPlayer:            false,
-			UseServerDNS:           false,
-			VideoPlatform:          1024,
+// 用 map 而不是结构体：Go 的 json.Marshal 对 map 键排序，
+// 与在役客户端发出的字节完全一致（请求体本身参与签名）。
+func buildPlaybackBody(vid string) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"video_id": vid,
+		"biz_param": map[string]any{
+			"video_id_type":             0,
+			"need_all_video_definition": true,
+			"video_platform":            3,
 		},
-		MixedVideoIDMap: map[string][]string{"1004": {vid}},
 	})
 	return body
 }
 
-// shortplayRequest 请求番茄小说客户端短剧接口（aid=1967）。
-//
-// 与源实现一致：body 不压缩，条目不按设备参数展开。
-func (c *Client) shortplayRequest(ctx context.Context, vid string) (map[string]any, error) {
-	pairs := []kv{
+// playbackDeviceOrdered 返回取址请求的设备参数（插入序即签名顺序）。
+func (c *Client) playbackDeviceOrdered() []kv {
+	model, brand, osVersion, osAPI, resolution, dpi, channel, _ := c.device.profileOf()
+	return []kv{
 		{"iid", c.device.IID},
 		{"device_id", c.device.DeviceID},
-		{"aid", "1967"},
-		{"app_name", "novelapp"},
-		{"version_code", "72132"},
-		{"version_name", "7.2.1.32"},
-		{"device_platform", "android"},
-		{"device_brand", "Xiaomi"},
-		{"os_version", "13"},
+		{"ac", "wifi"},
+		{"channel", channel},
+		{"aid", playbackAID},
+		{"app_name", "novelread"},
 		{"cdid", c.device.CDID},
+		{"version_code", playbackVersionCode},
+		{"version_name", playbackVersionName},
+		{"device_platform", "android"},
+		{"os", "android"},
+		{"ssmix", "a"},
+		{"device_type", model},
+		{"device_brand", brand},
+		{"language", "zh"},
+		{"os_api", osAPI},
+		{"os_version", osVersion},
+		{"manifest_version_code", playbackVersionCode},
+		{"resolution", resolution},
+		{"dpi", dpi},
+		{"update_version_code", playbackVersionCode},
+		{"host_abi", "arm64-v8a"},
+		{"dragon_device_type", "phone"},
+		{"pv_player", playbackVersionCode},
+		{"compliance_status", "0"},
+		{"need_personal_recommend", "1"},
+		{"player_so_load", "1"},
+		{"is_android_pad_screen", "0"},
+		{"openudid", c.device.OpenUDID},
 	}
-	query := encodeOrderedQuery(pairs)
-	target := c.shortPlayAPI + "?" + query
+}
 
-	body, _ := json.Marshal(shortPlayPayload{
-		VideoID:     vid,
-		ContentType: 1004,
-		BizParam: shortPlayBizParam{
-			DetailPageVersion:      0,
-			DeviceLevel:            3,
-			DisableDiggStat:        false,
-			DisableVideoRelateBook: false,
-			FromVideoID:            "",
-			NeedAllVideoDefinition: true,
-			NeedMP4Align:           false,
-			Source:                 4,
-			UseOSPlayer:            false,
-			UseServerDNS:           false,
-			VideoPlatform:          3,
-		},
-	})
+// playbackSigned 构造取址请求：URL、请求头与请求体。
+//
+// 通过递增 _rticket 重试，直到命中 playbackBranch（与在役实现一致）。
+func (c *Client) playbackSigned(vid string) (string, map[string]string, []byte) {
+	body := buildPlaybackBody(vid)
+	base := time.Now().UnixMilli()
 
+	target := ""
+	query := ""
+	ticket := base
+	for offset := int64(0); offset < 32; offset++ {
+		ticket = base + offset
+		khronos := uint32(ticket / 1000)
+		pairs := append(c.playbackDeviceOrdered(),
+			kv{"ts", strconv.FormatUint(uint64(khronos), 10)},
+			kv{"_rticket", strconv.FormatInt(ticket, 10)},
+		)
+		query = encodeOrderedQuery(pairs)
+		target = c.playbackAPI + "?" + query
+		if sign.BranchOf(query, body, khronos) == playbackBranch {
+			break
+		}
+	}
+	return target, c.playbackHeaders(query, body, uint32(ticket/1000), ticket), body
+}
+
+// playbackHeaders 组装取址请求头：桩签名之外的字段 + 真实 Argus 551 / Ladon。
+func (c *Client) playbackHeaders(query string, body []byte, khronos uint32, ticket int64) map[string]string {
+	model, _, osVersion, _, _, _, _, build := c.device.profileOf()
 	headers := map[string]string{
-		"User-Agent":   "com.dragon.read",
-		"Content-Type": "application/json; charset=utf-8",
+		"User-Agent":                playbackUserAgent(model, osVersion, build),
+		"Accept":                    "application/json; charset=utf-8,application/x-protobuf",
+		"Content-Type":              "application/json; charset=UTF-8",
+		"x-xs-from-web":             "0",
+		"x-tt-request-tag":          "t=0;n=0",
+		"sdk-version":               "2",
+		"passport-sdk-version":      "50561",
+		"x-vc-bdturing-sdk-version": "3.7.2.cn",
+		"x-ss-dp":                   playbackAID,
+		"lc":                        "101",
+		"x-ss-req-ticket":           strconv.FormatInt(ticket, 10),
+		"x-khronos":                 strconv.FormatUint(uint64(khronos), 10),
+		"x-gorgon":                  sign.Gorgon(query, body, khronos, sign.RandomUint16()),
+		"x-helios":                  sign.Helios(khronos),
+		"x-tt-dt":                   "",
+		"x-ss-stub":                 sign.MD5Upper(body),
+		"x-reading-request":         readingRequestID(ticket),
+		"x-argus":                   sign.Argus551(body, query, khronos, sign.RandomUint32(), playbackAID, c.device.DeviceID, c.device.IID),
+		"x-ladon":                   sign.Ladon551(khronos, sign.RandomUint32(), playbackAID),
 	}
-	for key, value := range c.signPlayback(target, query, body) {
-		headers[key] = value
+	// 取址请求必须带设备 cookie（与在役客户端一致；未注册时没有 ttreq）。
+	if c.device.IID != "" {
+		cookie := "passport_csrf_token=; passport_csrf_token_default=; store-region=cn-hb; store-region-src=did; install_id=" + c.device.IID
+		if c.device.TTReq != "" {
+			cookie += "; ttreq=" + c.device.TTReq
+		}
+		headers["Cookie"] = cookie
 	}
-	return c.doJSONRaw(ctx, http.MethodPost, target, body, headers)
+	return headers
 }
 
-// shortPlayPayload 是短剧接口请求体（字段顺序与源实现一致）。
-type shortPlayPayload struct {
-	VideoID     string            `json:"video_id"`
-	ContentType int               `json:"content_type"`
-	BizParam    shortPlayBizParam `json:"biz_param"`
-}
-
-// shortPlayBizParam 是短剧接口的业务参数。
-type shortPlayBizParam struct {
-	DetailPageVersion      int    `json:"detail_page_version"`
-	DeviceLevel            int    `json:"device_level"`
-	DisableDiggStat        bool   `json:"disable_digg_stat"`
-	DisableVideoRelateBook bool   `json:"disable_video_relate_book"`
-	FromVideoID            string `json:"from_video_id"`
-	NeedAllVideoDefinition bool   `json:"need_all_video_definition"`
-	NeedMP4Align           bool   `json:"need_mp4_align"`
-	Source                 int    `json:"source"`
-	UseOSPlayer            bool   `json:"use_os_player"`
-	UseServerDNS           bool   `json:"use_server_dns"`
-	VideoPlatform          int    `json:"video_platform"`
-}
-
-// shortplayEntry 把短剧接口响应归一化成 data[vid] 形式的条目。
-func shortplayEntry(response map[string]any, vid string) map[string]any {
-	data, _ := response["data"].(map[string]any)
-	if data == nil {
-		return nil
-	}
-	if entry, ok := data[vid].(map[string]any); ok && entry != nil {
-		return entry
-	}
-	// 短剧接口直接返回 video_model 时，data 本身就是条目。
-	if _, ok := data["video_model"]; ok {
-		return data
-	}
-	return nil
+// readingRequestID 生成 x-reading-request：毫秒时间戳 + 随机数。
+func readingRequestID(ticket int64) string {
+	return strconv.FormatInt(ticket, 10) + "-" + strconv.FormatInt(int64(sign.RandomUint32()&0x7fffffff), 10)
 }
 
 // codeOf 读取响应中的业务状态码（兼容 Code / code，缺失或 0 视为成功）。
@@ -916,4 +793,10 @@ func gzipBytes(payload []byte) []byte {
 	_, _ = writer.Write(payload)
 	_ = writer.Close()
 	return buf.Bytes()
+}
+
+// playbackUserAgent 按机型档案构造取址请求的 UA（版本号必须与 version_code 一致）。
+func playbackUserAgent(model, osVersion, build string) string {
+	return "com.phoenix.read/" + playbackVersionCode + " (Linux; U; Android " + osVersion + "; zh_CN; " +
+		model + "; Build/" + build + "; Cronet/TTNetVersion:8d40f833 2026-03-03 QuicVersion:21ac1950 2025-11-18)"
 }

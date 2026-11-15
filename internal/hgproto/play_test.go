@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -34,13 +33,11 @@ const (
 
 // newPlayClientFor 把测试服务器装配成注入真实播放器签名器的客户端。
 //
-// 三个端点全部指向本地服务器，保证测试完全离线。
+// 取址端点指向本地服务器，保证测试完全离线。
 func newPlayClientFor(t *testing.T, srv *httptest.Server) *Client {
 	t.Helper()
 	c := NewClient(sign.PlayerSigner{}, DefaultDevice("1624456208323876", "1624456208327972", "91d56f7e-c027-4ce9-9a3c-229d59a13c3b"), WithGuard(nil))
-	c.videoAPI = srv.URL + "/player"
-	c.videoAPIFallback = srv.URL + "/player-fallback"
-	c.shortPlayAPI = srv.URL + "/shortplay"
+	c.playbackAPI = srv.URL + "/novel/player/video_model/v1/"
 	return c
 }
 
@@ -62,12 +59,12 @@ func playModelJSON(t *testing.T, model map[string]any) string {
 	return string(raw)
 }
 
-// playResponse 构造 data[vid].video_model 形式的取址响应。
-func playResponse(t *testing.T, vid, modelJSON string) []byte {
+// playResponse 构造 data.video_model 形式的取址响应（在役客户端形状）。
+func playResponse(t *testing.T, _ string, modelJSON string) []byte {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"code": 0,
-		"data": map[string]any{vid: map[string]any{"video_model": modelJSON}},
+		"data": map[string]any{"video_model": modelJSON},
 	})
 	if err != nil {
 		t.Fatalf("序列化测试响应失败: %v", err)
@@ -108,24 +105,23 @@ func gunzip(t *testing.T, raw []byte) []byte {
 }
 
 // TestPlaySendsSignedGzipPost 锁定取址请求形状（对齐源实现 playbackRequest）。
-func TestPlaySendsSignedGzipPost(t *testing.T) {
+// TestPlaySendsSignedPlaybackRequest 锁定取址请求形状：POST 到 video_model 路径、
+// 真实 Argus 551 / Ladon 信封、不带 x-medusa、body 为 {video_id, biz_param}。
+func TestPlaySendsSignedPlaybackRequest(t *testing.T) {
 	const vid = "30002"
 
 	var (
-		gotMethod   string
-		gotPath     string
-		gotHeaders  http.Header
-		gotQuery    url.Values
-		gotRawQuery string
-		gotBody     []byte
+		gotMethod  string
+		gotPath    string
+		gotHeaders http.Header
+		gotRaw     string
+		gotBody    []byte
 	)
 	model := playModelJSON(t, map[string]any{"video_list": []any{mockPlayItem(vid)}})
 	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod = r.Method
-		gotPath = r.URL.Path
+		gotMethod, gotPath = r.Method, r.URL.Path
 		gotHeaders = r.Header.Clone()
-		gotQuery = r.URL.Query()
-		gotRawQuery = r.URL.RawQuery
+		gotRaw = r.URL.RawQuery
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(playResponse(t, vid, model))
@@ -136,94 +132,81 @@ func TestPlaySendsSignedGzipPost(t *testing.T) {
 		t.Fatalf("Play: %v", err)
 	}
 
-	if gotMethod != http.MethodPost || gotPath != "/player" {
-		t.Fatalf("request = %s %s, want POST /player", gotMethod, gotPath)
+	if gotMethod != http.MethodPost || gotPath != "/novel/player/video_model/v1/" {
+		t.Fatalf("request = %s %s, want POST /novel/player/video_model/v1/", gotMethod, gotPath)
 	}
 	for key, want := range map[string]string{
-		"Accept":               "application/json; charset=utf-8,application/x-protobuf",
-		"Content-Type":         "application/json; charset=UTF-8",
-		"Content-Encoding":     "gzip",
-		"sdk-version":          "2",
-		"passport-sdk-version": "5051452",
-		"x-xs-from-web":        "0",
-		"x-ss-dp":              "8662",
+		"Accept":                    "application/json; charset=utf-8,application/x-protobuf",
+		"Content-Type":              "application/json; charset=UTF-8",
+		"x-xs-from-web":             "0",
+		"x-tt-request-tag":          "t=0;n=0",
+		"sdk-version":               "2",
+		"passport-sdk-version":      "50561",
+		"x-vc-bdturing-sdk-version": "3.7.2.cn",
+		"x-ss-dp":                   "8662",
+		"lc":                        "101",
+		"x-tt-dt":                   "",
 	} {
 		if got := gotHeaders.Get(key); got != want {
 			t.Errorf("header %s = %q, want %q", key, got, want)
 		}
 	}
-	// 签名必须作用于实际发送的 gzip 字节。
+	// 取址必须用真实 551 信封，且不得携带 x-medusa。
+	if _, ok := gotHeaders["x-medusa"]; ok {
+		t.Fatal("取址请求不得携带 x-medusa")
+	}
+	if argus := gotHeaders.Get("x-argus"); len(argus) < 64 || !strings.HasPrefix(argus, "8o") {
+		t.Fatalf("x-argus 不是真实信封: %q", argus)
+	}
+	if ladon := gotHeaders.Get("x-ladon"); len(ladon) < 40 {
+		t.Fatalf("x-ladon 过短: %q", ladon)
+	}
 	if stub := gotHeaders.Get("x-ss-stub"); stub != sign.MD5Upper(gotBody) {
 		t.Fatalf("x-ss-stub = %s, want %s", stub, sign.MD5Upper(gotBody))
 	}
-	for _, header := range []string{"x-khronos", "x-ladon", "x-argus", "x-ss-req-ticket"} {
+	for _, header := range []string{"x-khronos", "x-gorgon", "x-helios", "x-ss-req-ticket", "x-reading-request"} {
 		if gotHeaders.Get(header) == "" {
-			t.Errorf("缺少签名头 %s", header)
+			t.Errorf("缺少头 %s", header)
 		}
 	}
-	if ua := gotHeaders.Get("User-Agent"); !strings.Contains(ua, "74332") {
-		t.Errorf("user-agent = %q, want 74332", ua)
-	}
-	if cookie := gotHeaders.Get("Cookie"); cookie != "store-region=cn-bj; store-region-src=did; install_id=1624456208327972" {
-		t.Errorf("cookie = %q", cookie)
+	if ua := gotHeaders.Get("User-Agent"); !strings.Contains(ua, "73932") {
+		t.Errorf("user-agent = %q, want 73932", ua)
 	}
 
-	// query 的参数与顺序都必须与源实现的 PLAYBACK_DEVICE 展开一致（签名对 query 字节敏感）。
-	const wantQueryPrefix = "ac=wifi&channel=update_64&aid=8662&app_name=novelread&version_code=74332&" +
-		"version_name=7.4.3.32&device_platform=android&os=android&ssmix=a&device_type=25053RT47C&" +
-		"device_brand=Redmi&language=zh&os_api=36&os_version=16&manifest_version_code=74332&" +
-		"resolution=1280*2772&dpi=520&update_version_code=74332&host_abi=arm64-v8a&" +
-		"dragon_device_type=phone&pv_player=74332&compliance_status=0&need_personal_recommend=1&" +
-		"player_so_load=1&is_android_pad_screen=0&device_id=1624456208323876&" +
-		"iid=1624456208327972&cdid=91d56f7e-c027-4ce9-9a3c-229d59a13c3b&_rticket="
-	if !strings.HasPrefix(gotRawQuery, wantQueryPrefix) {
-		t.Fatalf("query = %s\nwant 前缀 %s", gotRawQuery, wantQueryPrefix)
-	}
-	if ticket := gotQuery.Get("_rticket"); len(ticket) != 13 {
-		t.Errorf("_rticket = %q, want 毫秒时间戳", ticket)
+	// query 顺序即签名输入，必须与在役客户端一致。
+	const wantQueryPrefix = "iid=1624456208327972&device_id=1624456208323876&ac=wifi&channel=update_64&" +
+		"aid=8662&app_name=novelread&cdid=91d56f7e-c027-4ce9-9a3c-229d59a13c3b&" +
+		"version_code=73932&version_name=7.3.9.32&device_platform=android&os=android&ssmix=a&" +
+		"device_type=25053RT47C&device_brand=Redmi&language=zh&os_api=36&os_version=16&" +
+		"manifest_version_code=73932&resolution=1280*2772&dpi=520&update_version_code=73932&" +
+		"host_abi=arm64-v8a&dragon_device_type=phone&pv_player=73932&compliance_status=0&" +
+		"need_personal_recommend=1&player_so_load=1&is_android_pad_screen=0&openudid=&ts="
+	if !strings.HasPrefix(gotRaw, wantQueryPrefix) {
+		t.Fatalf("query = %s\nwant 前缀 %s", gotRaw, wantQueryPrefix)
 	}
 
-	// 请求体：gzip 后是源实现约定的 JSON 形状。
+	// 请求体：{video_id, biz_param}，不压缩。
 	var payload map[string]any
-	if err := json.Unmarshal(gunzip(t, gotBody), &payload); err != nil {
-		t.Fatalf("请求体不是合法 JSON: %v", err)
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("请求体不是 JSON: %v", err)
 	}
-	if payload["dr_scene"] != "player" {
-		t.Errorf("dr_scene = %v", payload["dr_scene"])
+	if payload["video_id"] != vid {
+		t.Errorf("video_id = %v", payload["video_id"])
 	}
 	biz, _ := payload["biz_param"].(map[string]any)
-	if biz["video_platform"] != float64(1024) || biz["need_all_video_definition"] != true {
+	if biz["video_platform"] != float64(3) || biz["need_all_video_definition"] != true {
 		t.Errorf("biz_param = %v", biz)
-	}
-	ids, _ := payload["mixed_video_id_map"].(map[string]any)
-	batch, _ := ids["1004"].([]any)
-	if len(batch) != 1 || batch[0] != vid {
-		t.Errorf("mixed_video_id_map[1004] = %v, want [%s]", batch, vid)
 	}
 
 	// 解析结果：bytevc1 → hevc，明文片源不带 content_key。
-	if info.Codec != "hevc" {
-		t.Errorf("codec = %q, want hevc", info.Codec)
+	if info.Codec != "hevc" || info.Encrypted || info.ContentKey != "" {
+		t.Errorf("info = %+v", info)
 	}
-	if info.Encrypted {
-		t.Error("encrypted = true, want false")
-	}
-	if info.ContentKey != "" {
-		t.Errorf("content_key = %q, want omitted", info.ContentKey)
-	}
-	if info.URL != "https://qznovelvod.com/video_30002.mp4" {
-		t.Errorf("url = %q", info.URL)
-	}
-	if info.Definition != "1080p" {
-		t.Errorf("definition = %q", info.Definition)
-	}
-	if info.VideoMeta == nil || info.VideoMeta.VHeight != 1920 || info.VideoMeta.CodecType != "bytevc1" {
-		t.Errorf("video_meta = %+v", info.VideoMeta)
+	if info.URL != "https://qznovelvod.com/video_30002.mp4" || info.Definition != "1080p" {
+		t.Errorf("info = %+v", info)
 	}
 }
 
-// TestPlayEncryptionInfoRules 对齐源单测：encrypt_info 缺失可用，
-// 声明加密但没有 spade_a 时视为无效响应。
 func TestPlayEncryptionInfoRules(t *testing.T) {
 	const vid = "30002"
 
@@ -311,60 +294,6 @@ func TestPlayReportsByteVC2OnlyWithoutCompatibleSource(t *testing.T) {
 	})
 }
 
-// TestPlayFallsBackToSecondaryThenShortPlay 校验兜底顺序与空响应处理。
-func TestPlayFallsBackToSecondaryThenShortPlay(t *testing.T) {
-	const vid = "30003"
-
-	var paths []string
-	model := playModelJSON(t, map[string]any{"video_list": []any{mockPlayItem(vid)}})
-	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		switch r.URL.Path {
-		case "/shortplay":
-			// 短剧接口的响应形状同样是 data[vid]。
-			_, _ = w.Write(playResponse(t, vid, model))
-		default:
-			// HTTP 200 + 空响应体：必须视为失败并继续兜底。
-			w.WriteHeader(http.StatusOK)
-		}
-	}))
-
-	info, err := c.Play(context.Background(), vid)
-	if err != nil {
-		t.Fatalf("Play: %v", err)
-	}
-	if info.URL != "https://qznovelvod.com/video_30003.mp4" {
-		t.Fatalf("url = %q", info.URL)
-	}
-	want := []string{"/player", "/player-fallback", "/shortplay"}
-	if len(paths) != len(want) {
-		t.Fatalf("paths = %v, want %v", paths, want)
-	}
-	for i, path := range want {
-		if paths[i] != path {
-			t.Fatalf("paths = %v, want %v", paths, want)
-		}
-	}
-}
-
-// TestPlayReportsUnavailableWhenAllChannelsFail 三条通道全失败时报「取址不可用」。
-func TestPlayReportsUnavailableWhenAllChannelsFail(t *testing.T) {
-	var paths []string
-	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	_, err := c.Play(context.Background(), "30004")
-	if err == nil || !strings.Contains(err.Error(), "取址不可用") {
-		t.Fatalf("err = %v, want 取址不可用", err)
-	}
-	if len(paths) != 3 {
-		t.Fatalf("paths = %v, want 3 次请求", paths)
-	}
-}
-
-// TestPlayUsesModelFallbackAPI 模型没有内联 video_list 时改用 fallback_api。
 func TestPlayUsesModelFallbackAPI(t *testing.T) {
 	const vid = "30005"
 
@@ -376,7 +305,7 @@ func TestPlayUsesModelFallbackAPI(t *testing.T) {
 	model := playModelJSON(t, map[string]any{"fallback_api": ""})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/player":
+		case "/novel/player/video_model/v1/":
 			_, _ = w.Write(playResponse(t, vid, model))
 		case "/secondary-model":
 			gotPath = r.URL.Path
@@ -409,101 +338,6 @@ func TestPlayUsesModelFallbackAPI(t *testing.T) {
 	}
 }
 
-// TestPlayAcceptsShortplayModelShape 短剧接口直接返回 video_model 时也可用。
-func TestPlayAcceptsShortplayModelShape(t *testing.T) {
-	const vid = "30011"
-
-	model := playModelJSON(t, map[string]any{"video_list": []any{mockPlayItem(vid)}})
-	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/shortplay" {
-			body, err := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"video_model": model}})
-			if err != nil {
-				t.Errorf("序列化短剧响应失败: %v", err)
-			}
-			_, _ = w.Write(body)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	info, err := c.Play(context.Background(), vid)
-	if err != nil {
-		t.Fatalf("Play: %v", err)
-	}
-	if info.URL != "https://qznovelvod.com/video_30011.mp4" {
-		t.Fatalf("url = %q", info.URL)
-	}
-}
-
-// TestShortplayChannelRequestShape 锁定短剧通道的请求形状（对齐源实现 shortplayRequest）。
-func TestShortplayChannelRequestShape(t *testing.T) {
-	const vid = "30012"
-
-	var (
-		gotPath     string
-		gotHeaders  http.Header
-		gotQuery    url.Values
-		gotRawQuery string
-		gotBody     []byte
-	)
-	model := playModelJSON(t, map[string]any{"video_list": []any{mockPlayItem(vid)}})
-	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/shortplay" {
-			gotPath = r.URL.Path
-			gotHeaders = r.Header.Clone()
-			gotQuery = r.URL.Query()
-			gotRawQuery = r.URL.RawQuery
-			gotBody, _ = io.ReadAll(r.Body)
-			_, _ = w.Write(playResponse(t, vid, model))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	if _, err := c.Play(context.Background(), vid); err != nil {
-		t.Fatalf("Play: %v", err)
-	}
-	if gotPath != "/shortplay" {
-		t.Fatalf("path = %q", gotPath)
-	}
-	if ua := gotHeaders.Get("User-Agent"); ua != "com.dragon.read" {
-		t.Errorf("user-agent = %q", ua)
-	}
-	if ct := gotHeaders.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Errorf("content-type = %q", ct)
-	}
-	// 短剧请求体不压缩，签名直接作用于 JSON 字节。
-	if gotHeaders.Get("Content-Encoding") != "" {
-		t.Errorf("content-encoding = %q, want 空", gotHeaders.Get("Content-Encoding"))
-	}
-	if stub := gotHeaders.Get("x-ss-stub"); stub != sign.MD5Upper(gotBody) {
-		t.Errorf("x-ss-stub = %s, want %s", stub, sign.MD5Upper(gotBody))
-	}
-
-	const wantQueryPrefix = "iid=1624456208327972&device_id=1624456208323876&aid=1967&app_name=novelapp&" +
-		"version_code=72132&version_name=7.2.1.32&device_platform=android&device_brand=Xiaomi&" +
-		"os_version=13&cdid=91d56f7e-c027-4ce9-9a3c-229d59a13c3b"
-	if gotRawQuery != wantQueryPrefix {
-		t.Fatalf("query = %s\nwant %s", gotRawQuery, wantQueryPrefix)
-	}
-	if gotQuery.Get("aid") != "1967" {
-		t.Errorf("aid = %q", gotQuery.Get("aid"))
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(gotBody, &payload); err != nil {
-		t.Fatalf("请求体不是合法 JSON: %v", err)
-	}
-	if payload["video_id"] != vid || payload["content_type"] != float64(1004) {
-		t.Errorf("payload = %v", payload)
-	}
-	biz, _ := payload["biz_param"].(map[string]any)
-	if biz["source"] != float64(4) || biz["video_platform"] != float64(3) {
-		t.Errorf("biz_param = %v", biz)
-	}
-}
-
-// TestPlayMapsBackupURL 同一条目的 main_url / backup_url 映射为 url / backup_url。
 func TestPlayMapsBackupURL(t *testing.T) {
 	const vid = "30013"
 
@@ -698,12 +532,13 @@ func TestPlayDecryptsSpadeURLWithKeySeed(t *testing.T) {
 }
 
 // TestPlayRejectsMissingEntry 响应缺少 data[vid] 时报错。
-func TestPlayRejectsMissingEntry(t *testing.T) {
+// TestPlayRejectsMissingModel 响应缺 data.video_model 时报错。
+func TestPlayRejectsMissingModel(t *testing.T) {
 	c := newPlayClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"code":0,"data":{"99999":{"video_model":"{}"}}}`))
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	_, err := c.Play(context.Background(), "30009")
-	if err == nil || !strings.Contains(err.Error(), "未返回所选分集") {
+	if err == nil || !strings.Contains(err.Error(), "未返回本集片源模型") {
 		t.Fatalf("err = %v", err)
 	}
 }
