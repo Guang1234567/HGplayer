@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
 	"hgplayer/internal/guard"
@@ -27,8 +25,10 @@ type Client struct {
 	guard  *guard.Guard
 
 	// 端点（可覆盖，便于测试）。
-	videoAPI  string
-	searchAPI string
+	videoAPI         string
+	videoAPIFallback string
+	shortPlayAPI     string
+	searchAPI        string
 	// mdHost 是目录 / 详情类接口的域名。
 	mdHost string
 	// websiteAPI 是官网搜索接口。
@@ -51,6 +51,8 @@ func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	c := &Client{guard: g, device: device, signer: signer}
 	c.rebuildClients(g)
 	c.videoAPI = VideoAPI
+	c.videoAPIFallback = VideoAPIFallback
+	c.shortPlayAPI = ShortPlayAPI
 	c.searchAPI = SearchAPI
 	c.mdHost = metadataHost
 	c.websiteAPI = websiteSearchAPI
@@ -143,81 +145,5 @@ func queryOf(rawURL string) string {
 	return u.RawQuery
 }
 
-// buildQuery 把参数按字典序编码为 query 串（与源实现一致）。
-func buildQuery(params map[string]string) string {
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sortStrings(keys)
-	var pairs []string
-	for _, k := range keys {
-		pairs = append(pairs, quotePlus(k)+"="+quotePlus(params[k]))
-	}
-	return strings.Join(pairs, "&")
-}
-
-// quotePlus 对齐 Python urlencode（quote_plus）。
-func quotePlus(value string) string {
-	const hex = "0123456789ABCDEF"
-	var b strings.Builder
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '~' {
-			b.WriteByte(c)
-			continue
-		}
-		b.WriteByte('%')
-		b.WriteByte(hex[c>>4])
-		b.WriteByte(hex[c&0xF])
-	}
-	return strings.ReplaceAll(b.String(), "%20", "+")
-}
-
-// sortStrings 字典序排序。
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
-}
-
-// deviceParams 返回设备的 query 参数。
-func (c *Client) deviceParams(extra map[string]string) map[string]string {
-	params := map[string]string{
-		"ac":                    "wifi",
-		"channel":               "update_64",
-		"aid":                   "8662",
-		"app_name":              "novelread",
-		"version_code":          c.device.VersionCode,
-		"version_name":          c.device.VersionName,
-		"device_platform":       "android",
-		"os":                    "android",
-		"ssmix":                 "a",
-		"device_type":           "25053RT47C",
-		"device_brand":          "Redmi",
-		"language":              "zh",
-		"os_api":                "36",
-		"os_version":            "16",
-		"resolution":            "1280*2772",
-		"dpi":                   "520",
-		"manifest_version_code": c.device.ManifestVersion,
-		"update_version_code":   c.device.UpdateVersion,
-		"pv_player":             c.device.PVPlayer,
-		"device_id":             c.device.DeviceID,
-		"iid":                   c.device.IID,
-		"cdid":                  c.device.CDID,
-	}
-	for k, v := range extra {
-		params[k] = v
-	}
-	return params
-}
-
 // timestamp 返回当前 Unix 秒。
 func timestamp() int64 { return time.Now().Unix() }
-
-// itoa 转十进制字符串。
-func itoa(v int64) string { return strconv.FormatInt(v, 10) }

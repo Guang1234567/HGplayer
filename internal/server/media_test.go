@@ -24,8 +24,8 @@ func testMedia(t *testing.T, content []byte) func(id string) (int64, io.ReadSeek
 func newMediaServer(t *testing.T, provider MediaProvider) *Server {
 	t.Helper()
 	cfg := Config{
-		Version:      "test",
-		SessionToken: "tok",
+		Version:       "test",
+		SessionToken:  "tok",
 		MediaProvider: provider,
 	}
 	return New(cfg, nil)

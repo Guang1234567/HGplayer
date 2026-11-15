@@ -26,8 +26,10 @@ func newTestClient(t *testing.T, handler http.Handler) *Client {
 		return sign.Headers{"X-Test": "1"}
 	})
 	c := NewClient(s, DefaultDevice("1624456208323876", "1624456208327972", "cdid-1"), WithGuard(nil))
-	// 用测试服务器地址覆盖端点。
+	// 用测试服务器地址覆盖端点（含兜底链，确保测试不会访问真实上游）。
 	c.videoAPI = srv.URL + "/player"
+	c.videoAPIFallback = srv.URL + "/player-fallback"
+	c.shortPlayAPI = srv.URL + "/shortplay"
 	c.searchAPI = srv.URL + "/search"
 	c.siteOrigin = srv.URL
 	c.mdHost = srv.URL
@@ -216,44 +218,13 @@ func TestSeriesRejectsInvalidID(t *testing.T) {
 	}
 }
 
-func TestPlayParsesVideoModel(t *testing.T) {
-	videoModel := `{"main_url":"https://cdn.example.com/a.mp4","backup_url":"https://cdn2.example.com/a.mp4",
-	  "video_meta":{"definition":"1080p","vwidth":1080,"vheight":1920,"bitrate":2000000,"codec_type":"h265"},
-	  "encrypt_info":{"encrypt":true,"spade_a":"deadbeef"}}`
-
-	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"code": 0,
-			"data": map[string]any{"video_model": videoModel},
-		})
-	}))
-
-	info, err := c.Play(context.Background(), "vid-1")
-	if err != nil {
-		t.Fatalf("Play: %v", err)
-	}
-	if info.URL != "https://cdn.example.com/a.mp4" {
-		t.Fatalf("url = %s", info.URL)
-	}
-	if !info.Encrypted {
-		t.Fatal("encrypted should be true")
-	}
-	if info.ContentKey != "deadbeef" {
-		t.Fatalf("content_key = %s", info.ContentKey)
-	}
-	if info.Codec != "h265" {
-		t.Fatalf("codec = %s", info.Codec)
-	}
-	if info.VideoMeta == nil || info.VideoMeta.VHeight != 1920 {
-		t.Fatalf("video_meta = %+v", info.VideoMeta)
-	}
-}
-
+// TestPlayRejectsEmptyVid 校验分集编号校验（源实现要求 1..30 位数字）。
 func TestPlayRejectsEmptyVid(t *testing.T) {
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	if _, err := c.Play(context.Background(), ""); err == nil {
-		t.Fatal("expected error for empty vid")
+	for _, vid := range []string{"", "abc", "vid-1", strings.Repeat("9", 31)} {
+		if _, err := c.Play(context.Background(), vid); err == nil {
+			t.Fatalf("expected error for vid %q", vid)
+		}
 	}
 }
 

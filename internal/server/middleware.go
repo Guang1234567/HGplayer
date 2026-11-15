@@ -111,7 +111,7 @@ func isMediaPath(path string) bool {
 // Code 用于区分两类 401：LOCAL_SESSION 表示本地会话未建立，
 // ACCOUNT_TOKEN 表示上游账号凭证过期。前端据此分别处理。
 type errorResponse struct {
-	Code string `json:"code,omitempty"`
+	Code  string `json:"code,omitempty"`
 	Error string `json:"error"`
 }
 

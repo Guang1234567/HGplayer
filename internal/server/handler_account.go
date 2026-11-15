@@ -21,7 +21,7 @@ type loginRequest struct {
 	AccountID   string `json:"account_id"`
 	DisplayName string `json:"display_name"`
 	// Token 是上游凭证明文；真实实现中由登录流程从上游换取。
-	Token       string `json:"token,omitempty"`
+	Token string `json:"token,omitempty"`
 }
 
 // handleAccountGet 返回当前登录态。

@@ -42,7 +42,7 @@ func categoryAPIPath(category string) string {
 // 返回与前端约定的卡片列表：series_id、series_title、cover、episode_count、tags。
 func (c *Client) BrowseList(ctx context.Context, category string, genre string, page int) (*BrowseResult, error) {
 	if page < 1 || page > 50 {
-		return nil, fmt.Errorf("页码需为 1 至 50 的整数")
+		return nil, inputErrf("页码需为 1 至 50 的整数")
 	}
 
 	var apiPath string
@@ -72,10 +72,10 @@ func (c *Client) BrowseList(ctx context.Context, category string, genre string, 
 		}
 	} else {
 		if !validCategories[category] {
-			return nil, fmt.Errorf("分类无效: %s", category)
+			return nil, inputErrf("分类无效: %s", category)
 		}
 		if genre != "" && !genrePattern.MatchString(genre) {
-			return nil, fmt.Errorf("题材标识无效")
+			return nil, inputErrf("题材标识无效")
 		}
 		apiPath = categoryAPIPath(category)
 		body, err := buildCatalogBody(category, genre, 0, "", page)
@@ -208,13 +208,13 @@ func extractTags(v any) []string {
 func (c *Client) Search(ctx context.Context, keyword string, page int) (*SearchResult, error) {
 	keyword = strings.TrimSpace(keyword)
 	if keyword == "" {
-		return nil, fmt.Errorf("搜索关键词不能为空")
+		return nil, inputErrf("搜索关键词不能为空")
 	}
 	if len(keyword) > 80 {
-		return nil, fmt.Errorf("搜索关键词过长")
+		return nil, inputErrf("搜索关键词过长")
 	}
 	if page < 1 || page > 50 {
-		return nil, fmt.Errorf("页码需为 1 至 50 的整数")
+		return nil, inputErrf("页码需为 1 至 50 的整数")
 	}
 
 	// 官网搜索是主链路；失败（接口变更 / 网络异常）时回退到 App 端签名搜索。

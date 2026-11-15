@@ -1,6 +1,10 @@
 package server
 
 import (
+	"context"
+	"errors"
+
+	"hgplayer/internal/hgproto"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -80,5 +84,34 @@ func TestSessionGuardPassesMedia(t *testing.T) {
 	s.Handler().ServeHTTP(rr, req)
 	if rr.Code == http.StatusUnauthorized {
 		t.Fatalf("/media 不应被会话守卫拦截，got %d", rr.Code)
+	}
+}
+
+// TestWriteProtoErrorMapping 输入类错误映射 400，上游失败映射 502。
+func TestWriteProtoErrorMapping(t *testing.T) {
+	s := newTestServer("tok")
+
+	var client hgproto.Client
+	_, inputErr := client.Search(context.Background(), "  ", 1)
+	if inputErr == nil {
+		t.Fatal("空关键词应返回错误")
+	}
+
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"输入错误", inputErr, http.StatusBadRequest},
+		{"上游失败", errors.New("官网分集列表为空"), http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.writeProtoError(rr, tc.err)
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+		})
 	}
 }

@@ -102,30 +102,10 @@ func (s *Server) writeProtoError(w http.ResponseWriter, err error) {
 	s.logger.Warn("协议请求失败", "err", err.Error())
 	status := http.StatusBadGateway
 	// 输入类错误返回 400，便于前端区分「参数问题」与「上游问题」。
-	if isInputError(err) {
+	if hgproto.IsInputError(err) {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, errorResponse{Code: "PROTO_ERROR", Error: err.Error()})
-}
-
-// isInputError 判断是否为调用方参数错误。
-func isInputError(err error) bool {
-	msg := err.Error()
-	for _, kw := range []string{"无效", "不能为空", "过长", "需为", "为空"} {
-		if contains(msg, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 // atoiDefault 解析整数，失败时返回默认值。
