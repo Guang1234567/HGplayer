@@ -42,6 +42,8 @@ var containerTypes = map[string]bool{
 	"moov": true, "trak": true, "mdia": true, "minf": true,
 	"stbl": true, "edts": true, "dinf": true, "udta": true,
 	"mvex": true, "moof": true, "traf": true,
+	// CENC 保护方案的盒子：sinf 内含 frma（原始编码）与 schi/tenc。
+	"sinf": true, "schi": true,
 }
 
 // Parse 解析缓冲区中的全部 box，递归展开容器型 box 的子 box。

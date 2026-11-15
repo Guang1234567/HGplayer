@@ -176,11 +176,8 @@ async function playEpisode(ep: EpisodeBrief) {
   videoSrc.value = '';
   playError.value = '';
   try {
-    const info = await api.play(ep.vid);
-    if (info.encrypted) {
-      playError.value = '该片源受 CENC 保护，需要解密管线；当前仅支持未加密片源。';
-      return;
-    }
+    await api.play(ep.vid);
+    // 加密片源（CENC）由服务端解密后再按 Range 供给，前端只需同源地址。
     videoSrc.value = `/media/${encodeURIComponent(ep.vid)}`;
   } catch (err) {
     playError.value = err instanceof ApiException ? err.message : String(err);
