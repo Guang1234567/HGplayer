@@ -15,7 +15,6 @@ const (
 	ShortPlayAPI = "https://api3-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/"
 	// SearchAPI 搜索接口。
 	SearchAPI = "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v"
-
 )
 
 // AllowedDomains 是允许访问的上游域名白名单。

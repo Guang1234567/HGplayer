@@ -1,9 +1,11 @@
 package hgproto
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -27,9 +29,12 @@ type Client struct {
 	// 端点（可覆盖，便于测试）。
 	videoAPI  string
 	searchAPI string
-	seriesAPI string
 	// mdHost 是目录 / 详情类接口的域名。
 	mdHost string
+	// websiteAPI 是官网搜索接口。
+	websiteAPI string
+	// siteOrigin 是官网站点根地址（页面与接口同源）。
+	siteOrigin string
 }
 
 // Option 是客户端的可选项。
@@ -47,8 +52,9 @@ func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	c.rebuildClients(g)
 	c.videoAPI = VideoAPI
 	c.searchAPI = SearchAPI
-	c.seriesAPI = metadataHost + "/reading/bookapi/bookinfo/v/"
 	c.mdHost = metadataHost
+	c.websiteAPI = websiteSearchAPI
+	c.siteOrigin = websiteOrigin
 
 	for _, opt := range opts {
 		opt(c)
@@ -79,6 +85,28 @@ func (c *Client) doJSONRaw(ctx context.Context, method, target string, body []by
 	return c.doJSONWith(c.upRaw, ctx, method, target, body, headers)
 }
 
+// doRawBody 取原始响应体（不解析 JSON），用于官网服务端渲染页面。
+func (c *Client) doRawBody(ctx context.Context, target string, headers map[string]string) ([]byte, error) {
+	resp, err := upstream.DoWithRetry(ctx, func(ctx context.Context) (*upstream.Response, error) {
+		return c.upRaw.Do(ctx, upstream.Request{
+			Method:  http.MethodGet,
+			URL:     target,
+			Query:   queryOf(target),
+			Headers: headers,
+		})
+	}, upstream.DefaultRetryPolicy())
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status != 200 {
+		return nil, fmt.Errorf("上游返回 HTTP %d", resp.Status)
+	}
+	if len(bytes.TrimSpace(resp.Body)) == 0 {
+		return nil, fmt.Errorf("上游返回空响应")
+	}
+	return resp.Body, nil
+}
+
 // doJSONWith 是两条通道共用的请求执行逻辑。
 func (c *Client) doJSONWith(client *upstream.Client, ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
 	resp, err := upstream.DoWithRetry(ctx, func(ctx context.Context) (*upstream.Response, error) {
@@ -95,6 +123,9 @@ func (c *Client) doJSONWith(client *upstream.Client, ctx context.Context, method
 	}
 	if resp.Status != 200 {
 		return nil, fmt.Errorf("上游返回 HTTP %d", resp.Status)
+	}
+	if len(bytes.TrimSpace(resp.Body)) == 0 {
+		return nil, fmt.Errorf("上游返回空响应")
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
@@ -156,28 +187,28 @@ func sortStrings(s []string) {
 // deviceParams 返回设备的 query 参数。
 func (c *Client) deviceParams(extra map[string]string) map[string]string {
 	params := map[string]string{
-		"ac":                  "wifi",
-		"channel":             "update_64",
-		"aid":                 "8662",
-		"app_name":            "novelread",
-		"version_code":        c.device.VersionCode,
-		"version_name":        c.device.VersionName,
-		"device_platform":     "android",
-		"os":                  "android",
-		"ssmix":               "a",
-		"device_type":         "25053RT47C",
-		"device_brand":        "Redmi",
-		"language":            "zh",
-		"os_api":              "36",
-		"os_version":          "16",
-		"resolution":          "1280*2772",
-		"dpi":                 "520",
+		"ac":                    "wifi",
+		"channel":               "update_64",
+		"aid":                   "8662",
+		"app_name":              "novelread",
+		"version_code":          c.device.VersionCode,
+		"version_name":          c.device.VersionName,
+		"device_platform":       "android",
+		"os":                    "android",
+		"ssmix":                 "a",
+		"device_type":           "25053RT47C",
+		"device_brand":          "Redmi",
+		"language":              "zh",
+		"os_api":                "36",
+		"os_version":            "16",
+		"resolution":            "1280*2772",
+		"dpi":                   "520",
 		"manifest_version_code": c.device.ManifestVersion,
-		"update_version_code":  c.device.UpdateVersion,
-		"pv_player":           c.device.PVPlayer,
-		"device_id":           c.device.DeviceID,
-		"iid":                 c.device.IID,
-		"cdid":                c.device.CDID,
+		"update_version_code":   c.device.UpdateVersion,
+		"pv_player":             c.device.PVPlayer,
+		"device_id":             c.device.DeviceID,
+		"iid":                   c.device.IID,
+		"cdid":                  c.device.CDID,
 	}
 	for k, v := range extra {
 		params[k] = v

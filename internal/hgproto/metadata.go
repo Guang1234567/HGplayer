@@ -16,6 +16,9 @@ var errInvalidCategory = errors.New("分类无效")
 // metadataHost 是目录 / 详情类接口的域名。
 const metadataHost = "https://api5-normal-sinfonlineb.fqnovel.com"
 
+// metadataVersionName 是目录请求声明的客户端版本（同时用于 x-medusa 设备指纹）。
+const metadataVersionName = "7.3.5.32"
+
 // 目录分类的 req_scene 与 genre（与源实现一致）。
 var categories = map[string][2]string{
 	"real-drama":  {"default", "short_play"},
@@ -76,7 +79,7 @@ func (c *Client) metadataDeviceOrdered() []kv {
 		{"aid", "8662"},
 		{"app_name", "novelread"},
 		{"version_code", "73532"},
-		{"version_name", "7.3.5.32"},
+		{"version_name", metadataVersionName},
 		{"device_platform", "android"},
 		{"os", "android"},
 		{"ssmix", "a"},
@@ -144,6 +147,13 @@ func (c *Client) metadataSigned(apiPath string, values []kv, payload []byte) (st
 		"x-helios":              sign.Helios(khronos),
 		"x-tt-dt":               "",
 	}
+	if medusa, err := sign.Medusa(target, payload, khronos, sign.MedusaDevice{
+		DeviceID:    c.device.DeviceID,
+		VersionName: metadataVersionName,
+	}, sign.DefaultMedusaOptions()); err == nil {
+		headers["x-medusa"] = string(medusa)
+	}
+
 	if len(payload) > 0 {
 		headers["Content-Type"] = "application/json; charset=utf-8"
 		headers["x-ss-stub"] = sign.MD5Upper(payload)

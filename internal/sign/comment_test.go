@@ -5,8 +5,8 @@ import "testing"
 // 弹幕签名黄金向量：由 hongguo-open-player 的 danmaku-sign.js（GPL-3.0-only）
 // 对同一组固定输入生成，用于逐位比对 Go 实现。
 const (
-	vectorQuery   = "aid=8662&device_id=1234567890123456&iid=9876543210987654&app_name=novelread&version_name=7.3.5.32"
-	vectorStamp   = uint64(1700000000)
+	vectorQuery    = "aid=8662&device_id=1234567890123456&iid=9876543210987654&app_name=novelread&version_name=7.3.5.32"
+	vectorStamp    = uint64(1700000000)
 	vectorNonceHex = "0a141e28323c4450646e78" // 11 字节 nonce
 )
 

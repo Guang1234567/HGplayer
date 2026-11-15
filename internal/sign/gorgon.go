@@ -64,7 +64,7 @@ func xGorgon(query string, body []byte, timestamp, random uint32) string {
 		} else {
 			next = out[0]
 		}
-		out[i] = (^(reverseBits((next ^ value)&0xFF) ^ 20)) & 0xFF
+		out[i] = (^(reverseBits((next^value)&0xFF) ^ 20)) & 0xFF
 	}
 
 	prefix := concat([][]byte{
@@ -114,8 +114,8 @@ func heliosWithRandom(khronos, random uint32) string {
 
 	var output [][]byte
 	for at := 0; at < len(pad); at += 16 {
-		a := u64le(pad[at:at+8])
-		b := u64le(pad[at+8:at+16])
+		a := u64le(pad[at : at+8])
+		b := u64le(pad[at+8 : at+16])
 		for i := 0; i < 34; i++ {
 			b = (table[i] ^ (a + rotr64(b, 8))) & mask64
 			a = (b ^ rotr64(a, 61)) & mask64

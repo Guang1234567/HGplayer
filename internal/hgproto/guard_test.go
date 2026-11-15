@@ -17,6 +17,8 @@ func TestAllowedDomainsCoverEndpoints(t *testing.T) {
 		// 取址 / 搜索走字节域名。
 		"https://reading.snssdk.com/novel/player/multi_video_model/player/v1?vid=v1",
 		"https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v?query=x",
+		// 官网搜索走官网域名。
+		websiteSearchAPI + "?aid=8662&query=x&page=1",
 	}
 	for _, u := range urls {
 		if _, err := g.CheckURL(u); err != nil {

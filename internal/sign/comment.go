@@ -55,7 +55,7 @@ func commentXGorgon(rawQuery string, stamp uint64, nonce []byte) string {
 	}
 
 	for i := 0; i < 20; i++ {
-		seed[i] = (reverse8(rotl8(seed[i], 4) ^ seed[(i+1)%20]) ^ 0xEB) & 0xFF
+		seed[i] = (reverse8(rotl8(seed[i], 4)^seed[(i+1)%20]) ^ 0xEB) & 0xFF
 	}
 
 	prefix := []byte{0x84, 0x04, head2 & 0xFF, head3 & 0xFF, 0x00, 0x00}
@@ -91,8 +91,8 @@ func commentLadon(aid string, timestamp uint64, prefix []byte) string {
 
 	data := pkcs7Pad([]byte(itoa(int64(timestamp)) + "-1611921764-3019"))
 	for offset := 0; offset < len(data); offset += 16 {
-		bl := u64le(data[offset:offset+8])
-		br := u64le(data[offset+8:offset+16])
+		bl := u64le(data[offset : offset+8])
+		br := u64le(data[offset+8 : offset+16])
 		for _, key := range keys {
 			br = (key ^ (bl + rotr64(br, 8))) & mask64
 			bl = (br ^ rotl64(bl, 3)) & mask64
@@ -199,12 +199,12 @@ func commentArgus(rawQuery string, timestamp uint64, nonce []byte) string {
 func commentHeaders(rawQuery string, stamp uint64, nonce []byte, aid string) map[string]string {
 	trunc := stamp
 	return map[string]string{
-		"X-Gorgon":           commentXGorgon(rawQuery, trunc, nonce),
-		"X-Khronos":          strconv.FormatUint(trunc, 10),
-		"X-SS-Req-Ticket":    strconv.FormatUint(trunc*1000, 10),
-		"X-SS-STUB":          "",
-		"X-Argus":            commentArgus(rawQuery, trunc, nonce),
-		"X-Ladon":            commentLadon(aid, trunc, nonce[2:6]),
+		"X-Gorgon":        commentXGorgon(rawQuery, trunc, nonce),
+		"X-Khronos":       strconv.FormatUint(trunc, 10),
+		"X-SS-Req-Ticket": strconv.FormatUint(trunc*1000, 10),
+		"X-SS-STUB":       "",
+		"X-Argus":         commentArgus(rawQuery, trunc, nonce),
+		"X-Ladon":         commentLadon(aid, trunc, nonce[2:6]),
 	}
 }
 
@@ -213,26 +213,26 @@ func commentHeaders(rawQuery string, stamp uint64, nonce []byte, aid string) map
 // baseParams 弹幕请求的固定 query 参数。
 func baseParams(deviceID, installID string) map[string]string {
 	p := map[string]string{
-		"aid":                  "8662",
-		"app_name":             "novelread",
-		"version_code":         "73532",
-		"version_name":         "7.3.5.32",
+		"aid":                   "8662",
+		"app_name":              "novelread",
+		"version_code":          "73532",
+		"version_name":          "7.3.5.32",
 		"manifest_version_code": "73532",
-		"update_version_code":  "73532",
-		"channel":              "update_64",
-		"device_platform":      "android",
-		"os":                   "android",
-		"ssmix":                "a",
-		"device_type":          "25053RT47C",
-		"device_brand":         "Redmi",
-		"language":             "zh",
-		"os_api":               "36",
-		"os_version":           "16",
-		"resolution":           "1280*2772",
-		"dpi":                  "520",
-		"ac":                   "wifi",
-		"device_id":            deviceID,
-		"iid":                  installID,
+		"update_version_code":   "73532",
+		"channel":               "update_64",
+		"device_platform":       "android",
+		"os":                    "android",
+		"ssmix":                 "a",
+		"device_type":           "25053RT47C",
+		"device_brand":          "Redmi",
+		"language":              "zh",
+		"os_api":                "36",
+		"os_version":            "16",
+		"resolution":            "1280*2772",
+		"dpi":                   "520",
+		"ac":                    "wifi",
+		"device_id":             deviceID,
+		"iid":                   installID,
 	}
 	return p
 }
@@ -295,5 +295,3 @@ func reverseCopy(b []byte) []byte {
 	}
 	return out
 }
-
-

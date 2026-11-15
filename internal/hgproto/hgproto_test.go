@@ -29,8 +29,9 @@ func newTestClient(t *testing.T, handler http.Handler) *Client {
 	// 用测试服务器地址覆盖端点。
 	c.videoAPI = srv.URL + "/player"
 	c.searchAPI = srv.URL + "/search"
-	c.seriesAPI = srv.URL + "/bookinfo"
+	c.siteOrigin = srv.URL
 	c.mdHost = srv.URL
+	c.websiteAPI = srv.URL + "/api/search/result"
 	return c
 }
 
@@ -100,9 +101,54 @@ func TestBrowseListRejectsInvalidPage(t *testing.T) {
 	}
 }
 
-func TestSearchParsesResults(t *testing.T) {
+func TestSearchParsesWebsiteResults(t *testing.T) {
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"searchList": []any{
+				map[string]any{
+					"name": "搜索结果一",
+					"video_data": map[string]any{
+						"series_id": "1000999", "series_title": "搜索结果一",
+						"series_intro": "都市短剧", "episode_cnt": 30.0,
+						"tags": []any{"都市", "甜宠"},
+					},
+				},
+				// 关键词不匹配的条目应被过滤掉（上游会塞热门剧目）。
+				map[string]any{
+					"name": "无关剧目",
+					"video_data": map[string]any{
+						"series_id": "1000998", "series_title": "无关剧目", "series_intro": "古装",
+					},
+				},
+			},
+		})
+	}))
+
+	res, err := c.Search(context.Background(), "都市", 1)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(res.Results))
+	}
+	card := res.Results[0]
+	if card.SeriesID != "1000999" || card.SeriesTitle != "搜索结果一" || card.EpisodeCount != 30 {
+		t.Fatalf("card = %+v", card)
+	}
+	if len(card.Tags) != 2 {
+		t.Fatalf("tags = %v", card.Tags)
+	}
+}
+
+// 官网链路失败时必须回退到 App 端签名搜索。
+func TestSearchFallsBackToApp(t *testing.T) {
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/search/result") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"code": 0,
 			"data": map[string]any{
@@ -131,18 +177,11 @@ func TestSearchRejectsEmptyKeyword(t *testing.T) {
 }
 
 func TestSeriesInjectsLocalProgress(t *testing.T) {
+	payload := seriesRouterPayload("12345", "剧集A", []any{"111", "222"})
+	page := seriesPageHTML(t, payload)
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"code": 0,
-			"data": map[string]any{
-				"title": "剧集A",
-				"episode_list": []any{
-					map[string]any{"vid": "v1", "title": "第1集"},
-					map[string]any{"vid": "v2", "title": "第2集"},
-				},
-			},
-		})
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(page))
 	}))
 
 	detail, err := c.Series(context.Background(), "12345", &SavedProgress{EpisodeIndex: 2, PositionSec: 42, DurationSec: 100}, true)
@@ -154,6 +193,9 @@ func TestSeriesInjectsLocalProgress(t *testing.T) {
 	}
 	if len(detail.Episodes) != 2 {
 		t.Fatalf("episodes = %d", len(detail.Episodes))
+	}
+	if detail.Episodes[0].Vid != "111" || detail.Episodes[1].EpisodeIndex != 2 {
+		t.Fatalf("episodes = %+v", detail.Episodes)
 	}
 	if !detail.IsFavorite {
 		t.Fatal("is_favorite should be true")

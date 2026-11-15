@@ -74,8 +74,8 @@ func simonEncryptPadded(protobuf []byte) []byte {
 	}
 	out := make([]byte, len(protobuf))
 	for i := 0; i < len(protobuf); i += 16 {
-		xInput := u64le(protobuf[i:i+8])
-		x1Input := u64le(protobuf[i+8:i+16])
+		xInput := u64le(protobuf[i : i+8])
+		x1Input := u64le(protobuf[i+8 : i+16])
 		ct0, ct1 := simonEncrypt(xInput, x1Input, key[:])
 		binary.LittleEndian.PutUint64(out[i:i+8], ct0)
 		binary.LittleEndian.PutUint64(out[i+8:i+16], ct1)
@@ -110,15 +110,15 @@ func ladonExpandTable(md5Hex []byte) []uint64 {
 	}
 	table := make([]uint64, 36)
 	for i := 0; i < 36; i++ {
-		table[i] = binary.LittleEndian.Uint64(ht[i*8:i*8+8])
+		table[i] = binary.LittleEndian.Uint64(ht[i*8 : i*8+8])
 	}
 	return table
 }
 
 // ladonEncryptBlock 单块 16 字节加密。
 func ladonEncryptBlock(ht []uint64, data []byte, at int) []byte {
-	data0 := u64le(data[at:at+8])
-	data1 := u64le(data[at+8:at+16])
+	data0 := u64le(data[at : at+8])
+	data1 := u64le(data[at+8 : at+16])
 	for i := 0; i < 34; i++ {
 		data1 = ht[i] ^ ((data0 + rotr64(data1, 8)) & mask64)
 		data0 = data1 ^ rotl64(data0, 3)
@@ -187,9 +187,9 @@ type protoBuf struct {
 }
 
 type protoField struct {
-	tag    uint64
-	typ    int
-	value  uint64
+	tag     uint64
+	typ     int
+	value   uint64
 	blobIdx int
 }
 
@@ -217,7 +217,7 @@ func (p *protoBuf) putBytes(idx uint64, data []byte) *protoBuf {
 func (p *protoBuf) toBuf() []byte {
 	var parts [][]byte
 	for _, f := range p.fields {
-		parts = append(parts, varint((f.tag << 3) | uint64(f.typ)))
+		parts = append(parts, varint((f.tag<<3)|uint64(f.typ)))
 		if f.typ == 0 {
 			parts = append(parts, varint(f.value))
 		} else if f.typ == 2 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -172,7 +173,7 @@ func parseBrowsePayload(payload map[string]any) ([]SeriesCard, bool, error) {
 			Cover:        normalizeCover(firstString(video["cover"], "")),
 			EpisodeCount: toInt(video["episode_cnt"]),
 			Description:  cleanTitle(firstString(video["video_desc"], video["series_intro"], "")),
-			Tags:          extractTags(video["sub_title_list"]),
+			Tags:         extractTags(video["sub_title_list"]),
 		})
 	}
 
@@ -216,28 +217,17 @@ func (c *Client) Search(ctx context.Context, keyword string, page int) (*SearchR
 		return nil, fmt.Errorf("页码需为 1 至 50 的整数")
 	}
 
-	params := c.deviceParams(map[string]string{
-		"query":      keyword,
-		"count":      "20",
-		"tab_type":   "11",
-	})
-	params["_rticket"] = strconv.FormatInt(timestamp()*1000, 10)
-
-	target := c.searchAPI + "?" + buildQuery(params)
-
-	payload, err := c.doJSON(ctx, "GET", target, nil, map[string]string{
-		"User-Agent": searchUA,
-		"Accept":     "application/json",
-	})
-	if err != nil {
-		return nil, err
+	// 官网搜索是主链路；失败（接口变更 / 网络异常）时回退到 App 端签名搜索。
+	results, webErr := c.searchWebsite(ctx, keyword, page)
+	if webErr == nil {
+		return &SearchResult{Results: results, Page: page}, nil
 	}
 
-	results, err := parseSearchPayload(payload)
-	if err != nil {
-		return nil, err
+	results, appErr := c.searchApp(ctx, keyword, page)
+	if appErr == nil {
+		return &SearchResult{Results: results, Page: page}, nil
 	}
-	return &SearchResult{Results: results, Page: page}, nil
+	return nil, fmt.Errorf("搜索暂不可用：官网 %v；App %v", webErr, appErr)
 }
 
 // SearchResult 是搜索结果。
@@ -281,7 +271,7 @@ func parseSearchPayload(payload map[string]any) ([]SeriesCard, error) {
 			SeriesID:     id,
 			SeriesTitle:  title,
 			Cover:        normalizeCover(firstString(book["cover"], "")),
-			EpisodeCount: toInt(firstInt(book["episode_cnt"])),
+			EpisodeCount: toInt(book["episode_cnt"]),
 			Description:  cleanTitle(firstString(book["video_desc"], book["series_intro"], "")),
 			Tags:         extractTags(book["sub_title_list"]),
 		})
@@ -294,37 +284,38 @@ func cleanTitle(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// normalizeCover 处理封面 URL。
-func normalizeCover(s string) string {
-	if s == "" {
+var (
+	coverHTTPPattern     = regexp.MustCompile(`(?i)^https?://`)
+	coverHEICPathPattern = regexp.MustCompile(`(?i)\.heic$`)
+	coverHostPattern     = regexp.MustCompile(`(?i)(^|\.)(fqnovelpic\.com|byteimg\.com)$`)
+)
+
+// normalizeCover 规范化封面地址。
+//
+// HEIC 在 Chromium 下无法解码：能转换的转为已验证的 JPEG 变体，否则置空，
+// 避免前端出现破图（与源实现 catalogCover 一致）。查询串（x-signature 等）
+// 不影响判定，因此按 pathname 判断后缀。
+func normalizeCover(value string) string {
+	s := strings.TrimSpace(value)
+	if !coverHTTPPattern.MatchString(s) {
 		return ""
 	}
-	if strings.HasSuffix(strings.ToLower(s), ".heic") {
-		// HEIC 封面转为兼容的 JPEG 变体。
-		if u := heicToJPEG(s); u != "" {
-			return u
-		}
+	u, err := url.Parse(s)
+	if err != nil || !coverHEICPathPattern.MatchString(u.Path) {
+		return s
 	}
-	return s
+	return heicToJPEG(u)
 }
 
-// heicToJPEG 将受支持的 HEIC 封面转为 JPEG。
-func heicToJPEG(value string) string {
-	u, err := parseURL(value)
-	if err != nil {
+// heicToJPEG 把 HEIC 封面转为已验证的 JPEG 变体；不可转换时返回空串。
+func heicToJPEG(u *url.URL) string {
+	if !coverHostPattern.MatchString(u.Hostname()) {
 		return ""
 	}
-	if u.Hostname() != "fqnovelpic.com" && u.Hostname() != "byteimg.com" {
+	if !strings.HasPrefix(u.Path, "/novel-pic/") || !strings.Contains(u.Path, "~") {
 		return ""
 	}
-	if !strings.HasPrefix(u.path, "/novel-pic/") {
-		return ""
-	}
-	idx := strings.Index(u.path, "~")
-	if idx < 0 {
-		return ""
-	}
-	return "https://p3-novel.byteimg.com" + u.path[:idx] + "~tplv-shrink:640:0.image"
+	return "https://p3-novel.byteimg.com" + strings.SplitN(u.Path, "~", 2)[0] + "~tplv-shrink:640:0.image"
 }
 
 // 小工具。
@@ -359,40 +350,3 @@ func toInt(v any) int {
 	}
 	return 0
 }
-
-func firstInt(v any) any { return v }
-
-// parseURL 解析 URL，避免额外依赖。
-func parseURL(s string) (*urlParser, error) {
-	return newURLParser(s)
-}
-
-// urlParser 是最小 URL 解析器，仅支持 host/path 提取。
-type urlParser struct {
-	host string
-	path string
-}
-
-func newURLParser(raw string) (*urlParser, error) {
-	rest := raw
-	if i := strings.Index(rest, "://"); i >= 0 {
-		rest = rest[i+3:]
-	}
-	p := &urlParser{}
-	if j := strings.Index(rest, "/"); j >= 0 {
-		p.host = rest[:j]
-		p.path = rest[j:]
-	} else {
-		p.host = rest
-	}
-	if p.host == "" {
-		return nil, fmt.Errorf("URL 无效")
-	}
-	return p, nil
-}
-
-func (u *urlParser) Hostname() string {
-	return strings.Split(u.host, ":")[0]
-}
-
-func (u *urlParser) Path() string { return u.path }
