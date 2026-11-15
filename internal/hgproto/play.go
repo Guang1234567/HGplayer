@@ -62,22 +62,33 @@ func (c *Client) Play(ctx context.Context, vid string) (*PlayInfo, error) {
 		return nil, inputErrf("分集编号无效")
 	}
 
-	target, headers, body := c.playbackSigned(vid)
-	response, err := c.doJSONRaw(ctx, http.MethodPost, target, body, headers)
-	if err != nil {
-		return nil, fmt.Errorf("App 取址不可用：%v", err)
-	}
-	if code := codeOf(response); code != 0 {
-		return nil, fmt.Errorf("App 接口暂未提供本集播放信息")
-	}
+	for attempt := 0; attempt < playbackDeviceAttempts; attempt++ {
+		target, headers, body := c.playbackSigned(vid)
+		response, err := c.doJSONRaw(ctx, http.MethodPost, target, body, headers)
+		if err != nil {
+			// 平台按设备限流：换一台新注册的设备重试。
+			if c.registrar != nil && attempt+1 < playbackDeviceAttempts && errors.Is(err, errEmptyUpstream) {
+				device, regErr := c.registrar(ctx)
+				if regErr == nil {
+					c.device = device
+					continue
+				}
+			}
+			return nil, fmt.Errorf("App 取址不可用：%v", err)
+		}
+		if code := codeOf(response); code != 0 {
+			return nil, fmt.Errorf("App 接口暂未提供本集播放信息")
+		}
 
-	data, _ := response["data"].(map[string]any)
-	model := data["video_model"]
-	if model == nil {
-		return nil, fmt.Errorf("App 接口未返回本集片源模型")
+		data, _ := response["data"].(map[string]any)
+		model := data["video_model"]
+		if model == nil {
+			return nil, fmt.Errorf("App 接口未返回本集片源模型")
+		}
+		// 复用解析链路：把模型包成带 video_model 的分集条目。
+		return c.parseEntryPlayInfo(ctx, vid, map[string]any{"video_model": model})
 	}
-	// 复用解析链路：把模型包成带 video_model 的分集条目。
-	return c.parseEntryPlayInfo(ctx, vid, map[string]any{"video_model": model})
+	return nil, fmt.Errorf("App 取址不可用：设备已多次被限流")
 }
 
 // 取址走独立签名：真实 Argus 551 / Ladon 信封，且不带 x-medusa。
@@ -97,6 +108,8 @@ const (
 	playbackAID = "8662"
 	// playbackBranch 是取址请求要求命中的 f13 分支。
 	playbackBranch = 1
+	// playbackDeviceAttempts 是取址最多尝试的设备台数（含首次）。
+	playbackDeviceAttempts = 3
 )
 
 // playbackPayload 是取址请求体。
@@ -204,7 +217,16 @@ func (c *Client) playbackHeaders(query string, body []byte, khronos uint32, tick
 	}
 	// 取址请求必须带设备 cookie（与在役客户端一致；未注册时没有 ttreq）。
 	if c.device.IID != "" {
-		cookie := "passport_csrf_token=; passport_csrf_token_default=; store-region=cn-hb; store-region-src=did; install_id=" + c.device.IID
+		region := c.device.StoreRegion
+		if region == "" {
+			region = "cn-hb"
+		}
+		regionSrc := c.device.StoreRegionSrc
+		if regionSrc == "" {
+			regionSrc = "did"
+		}
+		cookie := "passport_csrf_token=; passport_csrf_token_default=; store-region=" + region +
+			"; store-region-src=" + regionSrc + "; install_id=" + c.device.IID
 		if c.device.TTReq != "" {
 			cookie += "; ttreq=" + c.device.TTReq
 		}

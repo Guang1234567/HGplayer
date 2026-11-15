@@ -106,18 +106,21 @@ func newApp() (*app, error) {
 	}
 
 	signer := sign.PlayerSigner{}
-	proto := hgproto.NewClient(signer, hgproto.Device{
-		DeviceID:        info.DeviceID,
-		IID:             info.IID,
-		CDID:            info.CDID,
-		VersionCode:     "74332",
-		VersionName:     "7.4.3.32",
-		ManifestVersion: "74332",
-		UpdateVersion:   "74332",
-		PVPlayer:        "74332",
-		OpenUDID:        info.OpenUDID,
-		TTReq:           info.TTReq,
-	})
+	var proto *hgproto.Client
+	proto = hgproto.NewClient(signer, deviceOf(info),
+		// 取址被平台按设备限流时注册一台新设备，并持久化。
+		hgproto.WithDeviceRegistrar(func(ctx context.Context) (hgproto.Device, error) {
+			fresh, err := proto.RegisterDevice(ctx)
+			if err != nil {
+				return hgproto.Device{}, err
+			}
+			if saveErr := device.Save(dirs.Data, deviceInfoOf(fresh)); saveErr != nil {
+				logger.Warn("保存新设备身份失败", "err", saveErr)
+			}
+			logger.Info("已注册新的匿名设备", "device_id", fresh.DeviceID)
+			return fresh, nil
+		}),
+	)
 
 	svc := server.New(server.Config{
 		Version:       version,
@@ -182,3 +185,54 @@ func randomToken() string {
 
 // version 由构建期注入。
 var version = "0.1.0"
+
+// deviceOf 把持久化的设备身份映射为协议层设备。
+//
+// 机型档案为空时由协议层套用默认档案；注册过的设备带自己的档案。
+func deviceOf(info device.Info) hgproto.Device {
+	return hgproto.Device{
+		DeviceID:        info.DeviceID,
+		IID:             info.IID,
+		CDID:            info.CDID,
+		OpenUDID:        info.OpenUDID,
+		TTReq:           info.TTReq,
+		StoreRegion:     info.StoreRegion,
+		StoreRegionSrc:  info.StoreRegionSrc,
+		Model:           info.Model,
+		Brand:           info.Brand,
+		OSVersion:       info.OSVersion,
+		OSAPI:           info.OSAPI,
+		Resolution:      info.Resolution,
+		DPI:             info.DPI,
+		Channel:         info.Channel,
+		Build:           info.Build,
+		VersionCode:     "74332",
+		VersionName:     "7.4.3.32",
+		ManifestVersion: "74332",
+		UpdateVersion:   "74332",
+		PVPlayer:        "74332",
+	}
+}
+
+// deviceInfoOf 把协议层设备映射回持久化结构。
+func deviceInfoOf(dev hgproto.Device) device.Info {
+	return device.Info{
+		DeviceID:       dev.DeviceID,
+		IID:            dev.IID,
+		CDID:           dev.CDID,
+		OpenUDID:       dev.OpenUDID,
+		TTReq:          dev.TTReq,
+		StoreRegion:    dev.StoreRegion,
+		StoreRegionSrc: dev.StoreRegionSrc,
+		Model:          dev.Model,
+		Brand:          dev.Brand,
+		OSVersion:      dev.OSVersion,
+		OSAPI:          dev.OSAPI,
+		Resolution:     dev.Resolution,
+		DPI:            dev.DPI,
+		Channel:        dev.Channel,
+		Build:          dev.Build,
+		VersionCode:    dev.VersionCode,
+		VersionName:    dev.VersionName,
+	}
+}

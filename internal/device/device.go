@@ -20,6 +20,21 @@ type Info struct {
 	OpenUDID string `json:"openudid,omitempty"`
 	// TTReq 是设备注册下发的会话标记（取址 cookie 携带）。
 	TTReq string `json:"ttreq,omitempty"`
+	// StoreRegion / StoreRegionSrc 是注册下发的区域标记。
+	StoreRegion    string `json:"store_region,omitempty"`
+	StoreRegionSrc string `json:"store_region_src,omitempty"`
+	// 机型档案：注册时声明，后续所有请求必须保持一致。
+	Model      string `json:"device_model,omitempty"`
+	Brand      string `json:"device_brand,omitempty"`
+	OSVersion  string `json:"os_version,omitempty"`
+	OSAPI      string `json:"os_api,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	DPI        string `json:"dpi,omitempty"`
+	Channel    string `json:"channel,omitempty"`
+	Build      string `json:"build,omitempty"`
+	// VersionCode / VersionName 是注册声明的客户端版本。
+	VersionCode string `json:"version_code,omitempty"`
+	VersionName string `json:"version_name,omitempty"`
 }
 
 // fileName 是设备身份持久化文件名。

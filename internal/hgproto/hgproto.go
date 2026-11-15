@@ -43,6 +43,10 @@ type Device struct {
 	OpenUDID string
 	// TTReq 是设备注册下发的会话标记；未注册时为空。
 	TTReq string
+	// StoreRegion 是注册下发的区域（cookie 携带）。
+	StoreRegion string
+	// StoreRegionSrc 是区域来源标记。
+	StoreRegionSrc string
 
 	// 机型档案：必须与设备注册时声明的一致，否则风控会回绝请求。
 	Model      string

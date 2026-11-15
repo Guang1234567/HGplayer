@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,6 +14,12 @@ import (
 	"hgplayer/internal/sign"
 	"hgplayer/internal/upstream"
 )
+
+// errEmptyUpstream 表示上游返回 HTTP 200 但响应体为空。
+//
+// 这套网关用「200 + 空体」表示请求被回绝；取址接口按设备限流时也是这个形态，
+// 调用方据此换一台设备重试。
+var errEmptyUpstream = errors.New("上游返回空响应")
 
 // Client 是红果协议客户端，封装上游请求并注入签名与设备身份。
 type Client struct {
@@ -31,16 +38,25 @@ type Client struct {
 	searchAPI        string
 	// mdHost 是目录 / 详情类接口的域名。
 	mdHost string
+	// registerAPI 是设备注册接口。
+	registerAPI string
 	// playbackAPI 是取址接口（video_model）。
 	playbackAPI string
 	// websiteAPI 是官网搜索接口。
 	websiteAPI string
 	// siteOrigin 是官网站点根地址（页面与接口同源）。
 	siteOrigin string
+	// registrar 是设备注册器：取址被按设备限流时换一台新设备重试。
+	registrar func(context.Context) (Device, error)
 }
 
 // Option 是客户端的可选项。
 type Option func(*Client)
+
+// WithDeviceRegistrar 注入设备注册器（取址被限流时换新设备）。
+func WithDeviceRegistrar(fn func(context.Context) (Device, error)) Option {
+	return func(c *Client) { c.registrar = fn }
+}
 
 // WithGuard 指定域名守卫；传入 nil 时跳过校验（用于测试）。
 func WithGuard(g *guard.Guard) Option {
@@ -57,6 +73,7 @@ func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	c.shortPlayAPI = ShortPlayAPI
 	c.searchAPI = SearchAPI
 	c.mdHost = metadataHost
+	c.registerAPI = registerHost + registerPath
 	c.playbackAPI = playbackHost + playbackPath
 	c.websiteAPI = websiteSearchAPI
 	c.siteOrigin = websiteOrigin
@@ -107,7 +124,7 @@ func (c *Client) doRawBody(ctx context.Context, target string, headers map[strin
 		return nil, fmt.Errorf("上游返回 HTTP %d", resp.Status)
 	}
 	if len(bytes.TrimSpace(resp.Body)) == 0 {
-		return nil, fmt.Errorf("上游返回空响应")
+		return nil, errEmptyUpstream
 	}
 	return resp.Body, nil
 }
@@ -130,7 +147,7 @@ func (c *Client) doJSONWith(client *upstream.Client, ctx context.Context, method
 		return nil, fmt.Errorf("上游返回 HTTP %d", resp.Status)
 	}
 	if len(bytes.TrimSpace(resp.Body)) == 0 {
-		return nil, fmt.Errorf("上游返回空响应")
+		return nil, errEmptyUpstream
 	}
 	var parsed map[string]any
 	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
@@ -150,3 +167,6 @@ func queryOf(rawURL string) string {
 
 // timestamp 返回当前 Unix 秒。
 func timestamp() int64 { return time.Now().Unix() }
+
+// SetDevice 替换客户端使用的设备身份（注册新设备后调用）。
+func (c *Client) SetDevice(device Device) { c.device = device }
