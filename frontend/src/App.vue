@@ -26,8 +26,8 @@ const showLogin = ref(false);
 const categories = [
   { key: 'real-drama', label: '真人短剧' },
   { key: 'ai-drama', label: 'AI 短剧' },
+  { key: 'comic-drama', label: '漫剧' },
   { key: 'hot-drama', label: '热播榜' },
-  { key: 'comic', label: '漫剧' },
 ];
 const category = ref('real-drama');
 const cards = ref<SeriesCard[]>([]);

@@ -3,10 +3,10 @@ package hgproto
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // 目录与搜索的分类常量。
@@ -35,37 +35,68 @@ func categoryAPIPath(category string) string {
 
 // browseList 获取目录分类页。
 //
+// 分类页为 POST + JSON body；榜单为 GET。两者都通过元数据签名头鉴权，
+// 并依赖 branchOf 重试直到签名分支为 0。
+//
 // 返回与前端约定的卡片列表：series_id、series_title、cover、episode_count、tags。
 func (c *Client) BrowseList(ctx context.Context, category string, genre string, page int) (*BrowseResult, error) {
-	if !validCategories[category] {
-		return nil, fmt.Errorf("分类无效: %s", category)
-	}
 	if page < 1 || page > 50 {
 		return nil, fmt.Errorf("页码需为 1 至 50 的整数")
 	}
 
-	params := c.deviceParams(map[string]string{
-		"catalog_scope": "default",
-	})
-	if genre != "" {
-		if !regexp.MustCompile(`^cate_\d{1,8}$`).MatchString(genre) {
+	var apiPath string
+	var values []kv
+	var payload []byte
+
+	if rank, ok := rankings[category]; ok {
+		// 榜单：GET，参数全部走 query。
+		apiPath = "/reading/bookapi/bookmall/cell/change/v"
+		values = []kv{
+			{"tab_type", rankTabType(page)},
+			{"client_req_type", "2"},
+			{"client_template", "2"},
+			{"background_selected_items", ""},
+			{"category_id", "0"},
+			{"limit", "20"},
+			{"cell_sub_id", "0"},
+			{"gender", "2"},
+			{"cell_id", "7470092475068071998"},
+			{"selected_items", rank[0]},
+			{"sub_selected_items", rank[1]},
+			{"panel_selected_items", ""},
+			{"offset", "0"},
+			{"session_id", ""},
+			{"filter_ids", ""},
+			{"unlimited_selector_change_type", "0"},
+		}
+	} else {
+		if !validCategories[category] {
+			return nil, fmt.Errorf("分类无效: %s", category)
+		}
+		if genre != "" && !genrePattern.MatchString(genre) {
 			return nil, fmt.Errorf("题材标识无效")
 		}
-		params["selector_item_id"] = genre
+		apiPath = categoryAPIPath(category)
+		body, err := buildCatalogBody(category, genre, 0, "", page)
+		if err != nil {
+			return nil, err
+		}
+		payload = body
 	}
-	params["_rticket"] = strconv.FormatInt(timestamp()*1000, 10)
 
-	target := c.categoryAPI + "?" + buildQuery(params)
+	target, headers, body := c.metadataSigned(apiPath, values, payload)
 
-	payload, err := c.doJSON(ctx, "GET", target, nil, map[string]string{
-		"User-Agent": playbackUA,
-		"Accept":     "application/json",
-	})
+	method := http.MethodPost
+	if payload == nil {
+		method = http.MethodGet
+	}
+
+	parsed, err := c.doJSONRaw(ctx, method, target, body, headers)
 	if err != nil {
 		return nil, err
 	}
 
-	results, hasMore, err := parseBrowsePayload(payload)
+	results, hasMore, err := parseBrowsePayload(parsed)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +105,17 @@ func (c *Client) BrowseList(ctx context.Context, category string, genre string, 
 		Page:    page,
 		HasMore: hasMore,
 	}, nil
+}
+
+// genrePattern 校验题材标识。
+var genrePattern = regexp.MustCompile(`^cate_\d{1,8}$`)
+
+// rankTabType 返回榜单分页的 tab_type。
+func rankTabType(page int) string {
+	if page == 1 {
+		return "26"
+	}
+	return "18"
 }
 
 // BrowseResult 是目录浏览结果。
@@ -354,6 +396,3 @@ func (u *urlParser) Hostname() string {
 }
 
 func (u *urlParser) Path() string { return u.path }
-
-// compileTimeCheck 防止未使用导入。
-var _ = time.Now

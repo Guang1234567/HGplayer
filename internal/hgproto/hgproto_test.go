@@ -3,8 +3,11 @@ package hgproto
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"hgplayer/internal/sign"
@@ -27,7 +30,7 @@ func newTestClient(t *testing.T, handler http.Handler) *Client {
 	c.videoAPI = srv.URL + "/player"
 	c.searchAPI = srv.URL + "/search"
 	c.seriesAPI = srv.URL + "/bookinfo"
-	c.categoryAPI = srv.URL + "/category"
+	c.mdHost = srv.URL
 	return c
 }
 
@@ -209,5 +212,65 @@ func TestPlayRejectsEmptyVid(t *testing.T) {
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	if _, err := c.Play(context.Background(), ""); err == nil {
 		t.Fatal("expected error for empty vid")
+	}
+}
+
+// TestBrowseListSendsSignedPOST 锁定目录请求形状：
+// POST + 元数据签名头 + JSON body，且 query 的签名分支为 0。
+func TestBrowseListSendsSignedPOST(t *testing.T) {
+	var gotMethod, gotTarget string
+	var gotHeaders http.Header
+	var gotBody []byte
+
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotTarget = r.URL.String()
+		gotHeaders = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"video_data":[],"has_more":false}}`))
+	}))
+
+	if _, err := c.BrowseList(context.Background(), "real-drama", "", 1); err != nil {
+		t.Fatalf("BrowseList: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	for _, h := range []string{"x-gorgon", "x-helios", "x-ladon", "x-argus", "x-khronos", "x-ss-req-ticket", "x-ss-stub"} {
+		if gotHeaders.Get(h) == "" {
+			t.Errorf("缺少签名头 %s", h)
+		}
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(gotBody, &body); err != nil {
+		t.Fatalf("body 不是合法 JSON: %v", err)
+	}
+	if body["req_scene"] != "default" {
+		t.Errorf("req_scene = %v, want default", body["req_scene"])
+	}
+	if body["limit"] != float64(15) {
+		t.Errorf("limit = %v, want 15", body["limit"])
+	}
+	items, ok := body["select_items"].(map[string]any)
+	if !ok {
+		t.Fatal("缺少 select_items")
+	}
+	if genre, _ := items["genre"].([]any); len(genre) != 1 || genre[0] != "short_play" {
+		t.Errorf("select_items.genre = %v, want [short_play]", items["genre"])
+	}
+
+	// query 必须携带 ts 与 _rticket，且签名分支为 0。
+	if !strings.Contains(gotTarget, "ts=") || !strings.Contains(gotTarget, "_rticket=") {
+		t.Errorf("query 缺少 ts/_rticket: %s", gotTarget)
+	}
+	khronos, err := strconv.ParseUint(gotHeaders.Get("x-khronos"), 10, 32)
+	if err != nil {
+		t.Fatalf("x-khronos 非法: %v", err)
+	}
+	if br := sign.BranchOf(gotTarget, gotBody, uint32(khronos)); br != 0 {
+		t.Errorf("branchOf = %d, want 0", br)
 	}
 }

@@ -76,12 +76,6 @@ func xGorgon(query string, body []byte, timestamp, random uint32) string {
 
 // —— X-Helios ——
 
-// helios 生成 X-Helios 头值（base64）。
-func helios(khronos uint32) string {
-	random := uint32(1) // 占位；调用方注入随机数
-	return heliosWithRandom(khronos, random)
-}
-
 // heliosWithRandom 用指定随机数生成 X-Helios。
 func heliosWithRandom(khronos, random uint32) string {
 	data := concat([][]byte{le32(random), []byte("8662")})

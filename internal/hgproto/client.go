@@ -16,15 +16,20 @@ import (
 
 // Client 是红果协议客户端，封装上游请求并注入签名与设备身份。
 type Client struct {
-	up      *upstream.Client
-	device  Device
-	signer  sign.Signer
-	guard   *guard.Guard
+	// up 会自动注入播放器签名头（x-ladon/x-argus 等）。
+	up *upstream.Client
+	// upRaw 不注入签名头，用于自建头部（元数据 / 搜索）的请求。
+	upRaw  *upstream.Client
+	device Device
+	signer sign.Signer
+	guard  *guard.Guard
 
-	videoAPI    string
-	searchAPI   string
-	seriesAPI   string
-	categoryAPI string
+	// 端点（可覆盖，便于测试）。
+	videoAPI  string
+	searchAPI string
+	seriesAPI string
+	// mdHost 是目录 / 详情类接口的域名。
+	mdHost string
 }
 
 // Option 是客户端的可选项。
@@ -38,30 +43,46 @@ func WithGuard(g *guard.Guard) Option {
 // NewClient 创建协议客户端。
 func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	g := guard.New(AllowedDomains...)
-	c := &Client{
-		guard:       g,
-		up:          upstream.New(upstream.Options{Guard: g, Signer: signer, DeviceID: device.DeviceID, IID: device.IID, Timeout: 15 * time.Second}),
-		device:      device,
-		signer:      signer,
-		videoAPI:    VideoAPI,
-		searchAPI:   SearchAPI,
-		seriesAPI:   "https://hongguoduanju.com/reading/bookapi/bookinfo/v/",
-		categoryAPI: "https://hongguoduanju.com/reading/distribution/category/landpage/v/",
-	}
+	c := &Client{guard: g, device: device, signer: signer}
+	c.rebuildClients(g)
+	c.videoAPI = VideoAPI
+	c.searchAPI = SearchAPI
+	c.seriesAPI = metadataHost + "/reading/bookapi/bookinfo/v/"
+	c.mdHost = metadataHost
+
 	for _, opt := range opts {
 		opt(c)
 	}
 	if c.guard == nil {
-		c.up = upstream.New(upstream.Options{Signer: signer, DeviceID: device.DeviceID, IID: device.IID, Timeout: 15 * time.Second})
+		c.rebuildClients(nil)
 	}
 	return c
 }
 
+// rebuildClients 按给定守卫重建两条上游通道。
+func (c *Client) rebuildClients(g *guard.Guard) {
+	c.up = upstream.New(upstream.Options{
+		Guard: g, Signer: c.signer, DeviceID: c.device.DeviceID, IID: c.device.IID, Timeout: 15 * time.Second,
+	})
+	c.upRaw = upstream.New(upstream.Options{
+		Guard: g, DeviceID: c.device.DeviceID, IID: c.device.IID, Timeout: 15 * time.Second,
+	})
+}
 
-// doJSON 发起上游请求并解析 JSON 响应。
+// doJSON 发起上游请求（自动注入播放器签名头）并解析 JSON 响应。
 func (c *Client) doJSON(ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
+	return c.doJSONWith(c.up, ctx, method, target, body, headers)
+}
+
+// doJSONRaw 发起上游请求（不注入签名头，由调用方自建头部）并解析 JSON。
+func (c *Client) doJSONRaw(ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
+	return c.doJSONWith(c.upRaw, ctx, method, target, body, headers)
+}
+
+// doJSONWith 是两条通道共用的请求执行逻辑。
+func (c *Client) doJSONWith(client *upstream.Client, ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
 	resp, err := upstream.DoWithRetry(ctx, func(ctx context.Context) (*upstream.Response, error) {
-		return c.up.Do(ctx, upstream.Request{
+		return client.Do(ctx, upstream.Request{
 			Method:  method,
 			URL:     target,
 			Query:   queryOf(target),
