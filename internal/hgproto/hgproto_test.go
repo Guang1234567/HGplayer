@@ -228,6 +228,83 @@ func TestPlayRejectsEmptyVid(t *testing.T) {
 	}
 }
 
+// 榜单把卡片包在 cell_view.cell_data[].video_data 中，单对象与数组都要解析。
+func TestBrowseListParsesRankingShape(t *testing.T) {
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/reading/bookapi/bookmall/cell/change/v" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"cell_view":{"has_more":true,"cell_data":[
+			{"video_data":[{"series_id":"1001","title":"榜首短剧","episode_cnt":12}]},
+			{"video_data":{"series_id":"1002","title":"第二部"}},
+			{"ugc_user_data":[]}
+		]}}}`))
+	}))
+
+	res, err := c.BrowseList(context.Background(), categoryHot, "", 1)
+	if err != nil {
+		t.Fatalf("BrowseList: %v", err)
+	}
+	if len(res.Results) != 2 {
+		t.Fatalf("cards = %d, want 2", len(res.Results))
+	}
+	if res.Results[0].SeriesID != "1001" || res.Results[0].SeriesTitle != "榜首短剧" {
+		t.Fatalf("card0 = %+v", res.Results[0])
+	}
+	if res.Results[1].SeriesID != "1002" {
+		t.Fatalf("card1 = %+v", res.Results[1])
+	}
+	if !res.HasMore {
+		t.Fatal("has_more 应取自 cell_view")
+	}
+}
+
+// TestBrowseListUsesSharedCategoryPath 锁定分类页路径：上游只有统一入口，
+// 类别只体现在 req_scene。
+//
+// 拼出分类专用路径（如 /landpage/ai/v/）会被上游返回 404。
+func TestBrowseListUsesSharedCategoryPath(t *testing.T) {
+	cases := []struct {
+		category string
+		reqScene string
+		genre    string
+	}{
+		{categoryRealDrama, "default", "short_play"},
+		{categoryComic, "comic_series", "comic_series"},
+		{categoryAI, "ai_series", "ai_series"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.category, func(t *testing.T) {
+			var gotPath string
+			var gotBody map[string]any
+
+			c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"code":0,"data":{"video_data":[],"has_more":false}}`))
+			}))
+
+			if _, err := c.BrowseList(context.Background(), tc.category, "", 1); err != nil {
+				t.Fatalf("BrowseList(%s): %v", tc.category, err)
+			}
+			if gotPath != "/reading/distribution/category/landpage/v/" {
+				t.Errorf("path = %s, want 共用分类入口", gotPath)
+			}
+			if gotBody["req_scene"] != tc.reqScene {
+				t.Errorf("req_scene = %v, want %s", gotBody["req_scene"], tc.reqScene)
+			}
+			items, _ := gotBody["select_items"].(map[string]any)
+			genres, _ := items["genre"].([]any)
+			if len(genres) != 1 || genres[0] != tc.genre {
+				t.Errorf("select_items.genre = %v, want [%s]", items["genre"], tc.genre)
+			}
+		})
+	}
+}
+
 // TestBrowseListSendsSignedPOST 锁定目录请求形状：
 // POST + 元数据签名头 + JSON body，且 query 的签名分支为 0。
 func TestBrowseListSendsSignedPOST(t *testing.T) {

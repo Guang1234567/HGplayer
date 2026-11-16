@@ -13,26 +13,16 @@ import (
 // 目录与搜索的分类常量。
 const (
 	categoryRealDrama = "real-drama"
-	categoryComic     = "comic"
+	categoryComic     = "comic-drama"
 	categoryAI        = "ai-drama"
 	categoryHot       = "hot-drama"
 )
 
-var validCategories = map[string]bool{
-	categoryRealDrama: true, categoryComic: true, categoryAI: true, categoryHot: true,
-}
-
-// categoryAPIPath 返回分类页 API 路径。
-func categoryAPIPath(category string) string {
-	switch category {
-	case categoryComic:
-		return "/reading/distribution/category/landpage/comic/v/"
-	case categoryAI:
-		return "/reading/distribution/category/landpage/ai/v/"
-	default:
-		return "/reading/distribution/category/landpage/v/"
-	}
-}
+// categoryAPIPath 是分类页统一入口。
+//
+// 上游没有按分类拆分路径：req_scene 在请求体内区分类别。
+// 拼出 /landpage/comic/v/、/landpage/ai/v/ 之类路径会被上游直接 404。
+const categoryAPIPath = "/reading/distribution/category/landpage/v/"
 
 // browseList 获取目录分类页。
 //
@@ -71,13 +61,13 @@ func (c *Client) BrowseList(ctx context.Context, category string, genre string, 
 			{"unlimited_selector_change_type", "0"},
 		}
 	} else {
-		if !validCategories[category] {
+		if _, ok := categories[category]; !ok {
 			return nil, inputErrf("分类无效: %s", category)
 		}
 		if genre != "" && !genrePattern.MatchString(genre) {
 			return nil, inputErrf("题材标识无效")
 		}
-		apiPath = categoryAPIPath(category)
+		apiPath = categoryAPIPath
 		body, err := buildCatalogBody(category, genre, 0, "", page)
 		if err != nil {
 			return nil, err
@@ -139,6 +129,9 @@ type SeriesCard struct {
 var numericID = regexp.MustCompile(`^\d{1,30}$`)
 
 // parseBrowsePayload 解析目录响应。
+//
+// 分类页的卡片在 data.video_data；榜单（cell/change）把卡片包在
+// data.cell_view.cell_data[].video_data 里，两种形状都要支持。
 func parseBrowsePayload(payload map[string]any) ([]SeriesCard, bool, error) {
 	if code, ok := payload["code"].(float64); !ok || code != 0 {
 		return nil, false, fmt.Errorf("目录服务暂不可用")
@@ -149,6 +142,11 @@ func parseBrowsePayload(payload map[string]any) ([]SeriesCard, bool, error) {
 	}
 
 	rows, ok := data["video_data"].([]any)
+	if !ok {
+		if view, viewOK := data["cell_view"].(map[string]any); viewOK {
+			rows, ok = rankingRows(view)
+		}
+	}
 	if !ok {
 		return nil, false, fmt.Errorf("分类结构异常")
 	}
@@ -178,7 +176,36 @@ func parseBrowsePayload(payload map[string]any) ([]SeriesCard, bool, error) {
 	}
 
 	hasMore := data["has_more"] == true
+	if !hasMore {
+		if view, viewOK := data["cell_view"].(map[string]any); viewOK {
+			hasMore = view["has_more"] == true
+		}
+	}
 	return cards, hasMore, nil
+}
+
+// rankingRows 展开榜单的嵌套卡片列表。
+//
+// cell_data[].video_data 可能是单对象或数组；其它 cell（演员榜等）没有该字段。
+func rankingRows(view map[string]any) ([]any, bool) {
+	cells, ok := view["cell_data"].([]any)
+	if !ok {
+		return nil, false
+	}
+	var rows []any
+	for _, cell := range cells {
+		m, ok := cell.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch video := m["video_data"].(type) {
+		case []any:
+			rows = append(rows, video...)
+		case map[string]any:
+			rows = append(rows, video)
+		}
+	}
+	return rows, true
 }
 
 // extractTags 提取标签列表（最多 4 个）。
