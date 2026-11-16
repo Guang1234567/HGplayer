@@ -444,18 +444,29 @@ func TestFetchRangeRotatesOnUpstreamError(t *testing.T) {
 
 // flakyResolver 首次解析失败，之后成功；用于验证换设备重取。
 type flakyResolver struct {
+	mu       sync.Mutex
 	failures int
 	calls    int
 	src      StreamSource
 }
 
-// ResolveStream 实现 Resolver。
+// ResolveStream 实现 Resolver（并发安全：媒体请求会并发取址）。
 func (r *flakyResolver) ResolveStream(context.Context, string) (StreamSource, error) {
+	r.mu.Lock()
 	r.calls++
-	if r.calls <= r.failures {
+	calls := r.calls
+	r.mu.Unlock()
+	if calls <= r.failures {
 		return StreamSource{}, errors.New("App 取址不可用：上游返回空响应")
 	}
 	return r.src, nil
+}
+
+// callCount 返回取址次数。
+func (r *flakyResolver) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 // TestServeResolvesAgainAfterRefresh 取址失败时应刷新设备并重取一次。
@@ -486,8 +497,8 @@ func TestServeResolvesAgainAfterRefresh(t *testing.T) {
 	if refreshed != 1 {
 		t.Fatalf("刷新次数 = %d, want 1", refreshed)
 	}
-	if resolver.calls != 2 {
-		t.Fatalf("取址次数 = %d, want 2（失败后重取）", resolver.calls)
+	if resolver.callCount() != 2 {
+		t.Fatalf("取址次数 = %d, want 2（失败后重取）", resolver.callCount())
 	}
 }
 
@@ -520,7 +531,138 @@ func TestServeWithoutRefresherFailsFast(t *testing.T) {
 	if err := proxy.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/media/1", nil), "1"); err == nil {
 		t.Fatal("应返回取址错误")
 	}
-	if resolver.calls != 1 {
-		t.Fatalf("取址次数 = %d, want 1", resolver.calls)
+	if resolver.callCount() != 1 {
+		t.Fatalf("取址次数 = %d, want 1", resolver.callCount())
+	}
+}
+
+// TestWindowedServeConcurrentRequests 并发请求同一片源（窗口流水线 + 竞速 + 去重）。
+//
+// 真实播放器会并发发起多个 Range 请求；这里在 -race 下压这段路径，
+// 覆盖 inflight 去重、窗口缓存与多候选竞速的并发访问。
+func TestWindowedServeConcurrentRequests(t *testing.T) {
+	fixture, _, proxy, _ := newWindowFixture(t)
+	want, err := cenc.Decrypt(fixture.File, fixture.Key)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	failures := make(chan string, 32)
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := int64(i) * 40000
+			end := min(start+300000, int64(len(want))-1)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/media/123", nil)
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			if err := proxy.Serve(rec, req, "123"); err != nil {
+				failures <- fmt.Sprintf("Serve: %v", err)
+				return
+			}
+			if rec.Code != http.StatusPartialContent {
+				failures <- fmt.Sprintf("status = %d", rec.Code)
+				return
+			}
+			if !bytes.Equal(rec.Body.Bytes(), want[start:end+1]) {
+				failures <- fmt.Sprintf("区间 %d-%d 内容不一致", start, end)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(failures)
+	for msg := range failures {
+		t.Fatal(msg)
+	}
+}
+
+// TestServeRefreshConcurrentWithPlayback 换设备与播放取数并发。
+//
+// 取址失败触发的设备刷新会重建上游通道，同时窗口 goroutine 正在读通道；
+// 这段并发必须无竞争（-race 下验证）。
+func TestServeRefreshConcurrentWithPlayback(t *testing.T) {
+	key := bytes.Repeat([]byte{0x5c}, 16)
+	fixture := cenctest.Build([][]byte{cenctest.Pattern(3, 200000), cenctest.Pattern(4, 200000)}, key)
+	upstreamSrv := httptest.NewServer((&rangeUpstream{file: fixture.File}).handler())
+	t.Cleanup(upstreamSrv.Close)
+
+	want, err := cenc.Decrypt(fixture.File, key)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+
+	resolver := &flakyResolver{
+		failures: 1,
+		src: StreamSource{
+			URL:        upstreamSrv.URL + "/m.mp4",
+			Encrypted:  true,
+			ContentKey: hex.EncodeToString(key),
+		},
+	}
+	proxy := NewProxy(resolver, WithRefresher(func(context.Context) error { return nil }))
+	proxy.allowHost = func(string) bool { return true }
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			_ = proxy.Serve(rec, httptest.NewRequest(http.MethodGet, "/media/9", nil), "9")
+		}()
+	}
+	wg.Wait()
+
+	// 并发收敛后必须能正确供给。
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/media/9", nil)
+	req.Header.Set("Range", "bytes=0-1023")
+	if err := proxy.Serve(rec, req, "9"); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), want[:1024]) {
+		t.Fatalf("status=%d", rec.Code)
+	}
+}
+
+// TestConcurrentResolveFailuresRefreshOnce 并发取址失败只注册一台新设备。
+//
+// 播放器会并发发起多个请求；若每个失败都各自换设备，会瞬间烧掉多台设备。
+func TestConcurrentResolveFailuresRefreshOnce(t *testing.T) {
+	key := bytes.Repeat([]byte{0x6d}, 16)
+	fixture := cenctest.Build([][]byte{cenctest.Pattern(9, 100000)}, key)
+	upstreamSrv := httptest.NewServer((&rangeUpstream{file: fixture.File}).handler())
+	t.Cleanup(upstreamSrv.Close)
+
+	resolver := &flakyResolver{
+		failures: 8,
+		src: StreamSource{
+			URL:        upstreamSrv.URL + "/m.mp4",
+			Encrypted:  true,
+			ContentKey: hex.EncodeToString(key),
+		},
+	}
+	var refreshes atomic.Int32
+	proxy := NewProxy(resolver, WithRefresher(func(context.Context) error {
+		refreshes.Add(1)
+		time.Sleep(20 * time.Millisecond) // 拉长窗口，确保并发请求同时处于失败态
+		return nil
+	}))
+	proxy.allowHost = func(string) bool { return true }
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = proxy.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/media/7", nil), "7")
+		}()
+	}
+	wg.Wait()
+
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("设备刷新次数 = %d, want 1（并发失败必须单飞）", got)
 	}
 }

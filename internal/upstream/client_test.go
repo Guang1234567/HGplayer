@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,10 +83,11 @@ func TestDoTimeout(t *testing.T) {
 }
 
 func TestDoWithRetrySucceedsAfterTransient(t *testing.T) {
-	var calls int
+	// calls 会被多个 handler goroutine 并发访问，必须原子。
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls < 3 {
+		n := calls.Add(1)
+		if n < 3 {
 			// 模拟超时。
 			time.Sleep(300 * time.Millisecond)
 			w.WriteHeader(http.StatusOK)
@@ -108,8 +110,8 @@ func TestDoWithRetrySucceedsAfterTransient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DoWithRetry: %v", err)
 	}
-	if resp == nil || calls < 2 {
-		t.Fatalf("expected retry, calls = %d", calls)
+	if resp == nil || calls.Load() < 2 {
+		t.Fatalf("expected retry, calls = %d", calls.Load())
 	}
 }
 

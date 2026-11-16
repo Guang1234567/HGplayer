@@ -112,6 +112,9 @@ type Proxy struct {
 	logger Logger
 	// refresh 在取址失败时刷新设备身份；可为空。
 	refresh Refresher
+	// refreshMu/refreshing 让并发取址失败只触发一次设备刷新。
+	refreshMu  sync.Mutex
+	refreshing *refreshFlight
 	// inflightMu 保护 inflight：同一窗口的并发抓取合并成一次。
 	inflightMu sync.Mutex
 	inflight   map[windowKey]*windowFlight
@@ -141,6 +144,7 @@ func NewProxy(resolve Resolver, opts ...Option) *Proxy {
 //
 // 上游取址会偶发 HTTP 200 + 空响应（平台按设备限流）。同一设备重试无效，
 // 因此刷新设备身份后再取一次地址，避免整次播放直接 502。
+// 并发请求同时失败时只注册一台新设备（单飞），否则会瞬间烧掉多台设备。
 func (p *Proxy) resolveStream(ctx context.Context, vid string) (StreamSource, error) {
 	src, err := p.resolve.ResolveStream(ctx, vid)
 	if err == nil || p.refresh == nil {
@@ -150,17 +154,54 @@ func (p *Proxy) resolveStream(ctx context.Context, vid string) (StreamSource, er
 		return StreamSource{}, err
 	}
 
-	p.logf().Warn("媒体取址失败，换设备重取", "vid", vid, "err", err.Error())
-	if refreshErr := p.refresh(ctx); refreshErr != nil {
+	if refreshErr := p.refreshOnce(ctx); refreshErr != nil {
 		p.logf().Warn("刷新设备身份失败", "vid", vid, "err", refreshErr.Error())
 		return StreamSource{}, err
 	}
+	p.logf().Warn("媒体取址失败，已换设备重取", "vid", vid, "原错误", err.Error())
 	retried, retryErr := p.resolve.ResolveStream(ctx, vid)
 	if retryErr != nil {
 		return StreamSource{}, retryErr
 	}
 	p.logf().Info("换设备后取址成功", "vid", vid)
 	return retried, nil
+}
+
+// refreshFlight 是一次在途的设备刷新（单飞）。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// refreshOnce 触发一次设备刷新；并发调用共享同一次刷新结果。
+//
+// 取址失败往往是整批并发请求同时发生，若每个请求各自注册设备，
+// 会在几毫秒内连续烧掉多台设备并可能继续被限流。
+func (p *Proxy) refreshOnce(ctx context.Context) error {
+	p.refreshMu.Lock()
+	flight := p.refreshing
+	if flight == nil {
+		flight = &refreshFlight{done: make(chan struct{})}
+		p.refreshing = flight
+		p.refreshMu.Unlock()
+
+		err := p.refresh(ctx)
+		p.refreshMu.Lock()
+		flight.err = err
+		p.refreshing = nil
+		p.refreshMu.Unlock()
+		close(flight.done)
+		return err
+	}
+	p.refreshMu.Unlock()
+
+	select {
+	case <-flight.done:
+		// done 关闭后才读 err，happens-before 由 channel 建立。
+		return flight.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // maxRedirects 限制重定向跳数，避免代理被用作开放跳板。
