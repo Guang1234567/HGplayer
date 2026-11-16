@@ -36,7 +36,7 @@ func TestSetSessionCookieEnablesAPI(t *testing.T) {
 // TestProtoRoutesRequireSession 验证协议路由同样受会话守卫保护。
 func TestProtoRoutesRequireSession(t *testing.T) {
 	s := newTestServer("tok")
-	for _, path := range []string{"/api/catalog", "/api/search?q=x", "/api/series/1", "/api/play/v1"} {
+	for _, path := range []string{"/api/catalog", "/api/search?q=x", "/api/series/1", "/api/play/v1", "/api/rank/panel", "/api/rank"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rr := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rr, req)

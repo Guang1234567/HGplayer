@@ -85,6 +85,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/series/{id}", s.handleSeries)
 	mux.HandleFunc("GET /api/play/{vid}", s.handlePlay)
 
+	// —— 排行榜（分类 / 榜单分页）——
+	mux.HandleFunc("GET /api/rank/panel", s.handleRankPanel)
+	mux.HandleFunc("GET /api/rank", s.handleRank)
+
 	// —— 媒体代理 ——
 	mux.HandleFunc("GET /media/{id}", s.handleMedia)
 

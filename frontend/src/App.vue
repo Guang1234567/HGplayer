@@ -7,12 +7,14 @@ import {
   type ArchiveProgress,
   type EpisodeBrief,
   type PlayInfo,
+  type RankCategory,
+  type RankItem,
   type SeriesCard,
   type SeriesDetail,
 } from './api/client';
 
 // —— 视图 ——
-type View = 'catalog' | 'search' | 'series' | 'player' | 'history' | 'favorites';
+type View = 'catalog' | 'search' | 'series' | 'player' | 'history' | 'favorites' | 'rank';
 
 const view = ref<View>('catalog');
 const previousView = ref<View>('catalog');
@@ -71,6 +73,34 @@ const controlsVisible = ref(true);
 const history = ref<ArchiveProgress[]>([]);
 const favorites = ref<ArchiveFavorite[]>([]);
 const listLoading = ref(false);
+
+// —— 排行榜 ——
+const rankCategories = ref<RankCategory[]>([]);
+const rankID = ref('');
+const rankSubID = ref('');
+const rankPanelID = ref('');
+const rankItems = ref<RankItem[]>([]);
+const rankCursor = ref('');
+const rankHasMore = ref(false);
+const rankBusy = ref(false);
+const rankError = ref('');
+const rankPanelOpen = ref(false);
+let rankSeq = 0;
+
+const rankCategory = computed(
+  () => rankCategories.value.find((c) => c.id === rankID.value) ?? null,
+);
+const rankSubs = computed(() => rankCategory.value?.subs ?? []);
+const rankSub = computed(() => rankSubs.value.find((s) => s.id === rankSubID.value) ?? null);
+const rankGroups = computed(() => rankSub.value?.panel ?? []);
+const rankPanelLabel = computed(() => {
+  for (const group of rankGroups.value) {
+    for (const option of group.options) {
+      if (option.id === rankPanelID.value) return option.name;
+    }
+  }
+  return '总榜';
+});
 
 const speeds = [1, 1.25, 1.5, 2];
 
@@ -254,6 +284,120 @@ async function openFavorites() {
   } finally {
     listLoading.value = false;
   }
+}
+
+// —— 排行榜 ——
+async function openRank() {
+  view.value = 'rank';
+  rankError.value = '';
+  if (rankCategories.value.length === 0) {
+    await loadRankPanel();
+  }
+  ensureRankSelection();
+  if (rankID.value && rankSubID.value) {
+    void loadRank(true);
+  }
+}
+
+async function loadRankPanel() {
+  rankBusy.value = true;
+  try {
+    rankCategories.value = (await api.rankPanel()).categories ?? [];
+    resetRankSelection();
+  } catch (err) {
+    rankError.value = err instanceof ApiException ? err.message : String(err);
+  } finally {
+    rankBusy.value = false;
+  }
+}
+
+/** 选择第一个分类与其第一个子榜单。 */
+function resetRankSelection() {
+  const first = rankCategories.value[0];
+  rankID.value = first?.id ?? '';
+  rankSubID.value = first?.subs[0]?.id ?? '';
+  rankPanelID.value = '';
+}
+
+/** 修正失效的选择（分类或子榜单被上游调整时）。 */
+function ensureRankSelection() {
+  if (!rankCategories.value.some((c) => c.id === rankID.value)) {
+    resetRankSelection();
+    return;
+  }
+  if (!rankSubs.value.some((s) => s.id === rankSubID.value)) {
+    rankSubID.value = rankSubs.value[0]?.id ?? '';
+    rankPanelID.value = '';
+  }
+}
+
+async function loadRank(reset = false) {
+  if (!rankID.value || !rankSubID.value) return;
+  const seq = ++rankSeq;
+  rankBusy.value = true;
+  rankError.value = '';
+  if (reset) {
+    rankItems.value = [];
+    rankCursor.value = '';
+    rankHasMore.value = false;
+  }
+  try {
+    const res = await api.rank({
+      rank: rankID.value,
+      rank_sub: rankSubID.value,
+      rank_panel: rankPanelID.value || undefined,
+      cursor: reset ? undefined : rankCursor.value || undefined,
+    });
+    if (seq !== rankSeq) return;
+    const seen = new Set(rankItems.value.map((item) => item.id));
+    rankItems.value = reset
+      ? res.items
+      : [...rankItems.value, ...res.items.filter((item) => !seen.has(item.id))];
+    rankCursor.value = res.cursor;
+    rankHasMore.value = res.has_more;
+  } catch (err) {
+    if (seq === rankSeq) {
+      rankError.value = err instanceof ApiException ? err.message : String(err);
+    }
+  } finally {
+    if (seq === rankSeq) rankBusy.value = false;
+  }
+}
+
+function selectRankCategory(id: string) {
+  if (id === rankID.value) return;
+  rankID.value = id;
+  ensureRankSelection();
+  rankPanelOpen.value = false;
+  void loadRank(true);
+}
+
+function selectRankSub(id: string) {
+  if (id === rankSubID.value) return;
+  rankSubID.value = id;
+  rankPanelID.value = '';
+  rankPanelOpen.value = false;
+  void loadRank(true);
+}
+
+function selectRankPanel(id: string) {
+  rankPanelID.value = rankPanelID.value === id ? '' : id;
+  rankPanelOpen.value = false;
+  void loadRank(true);
+}
+
+function loadMoreRank() {
+  if (!rankHasMore.value || rankBusy.value) return;
+  void loadRank(false);
+}
+
+function openRankItem(item: RankItem) {
+  if (item.person) {
+    keyword.value = item.title;
+    void doSearch();
+    return;
+  }
+  if (item.id) void openSeries(item.id);
 }
 
 // —— 播放 ——
@@ -700,6 +844,15 @@ function openHistoryItem(item: ArchiveProgress) {
         {{ c.label }}
       </button>
 
+      <button class="nav-item" :class="{ active: view === 'rank' }" @click="openRank">
+        <span class="nav-icon">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+            <path d="M5 20V10M12 20V4M19 20v-7" stroke-linecap="round" />
+          </svg>
+        </span>
+        排行榜
+      </button>
+
       <div class="nav-group">我的</div>
       <button class="nav-item" :class="{ active: view === 'history' }" @click="openHistory">
         <span class="nav-icon">
@@ -762,7 +915,9 @@ function openHistoryItem(item: ArchiveProgress) {
                     ? '播放历史'
                     : view === 'favorites'
                       ? '我的收藏'
-                      : '剧集详情'
+                      : view === 'rank'
+                        ? '排行榜'
+                        : '剧集详情'
             }}
           </h1>
           <div class="search">
@@ -957,7 +1112,7 @@ function openHistoryItem(item: ArchiveProgress) {
         </template>
 
         <!-- 收藏 -->
-        <template v-else>
+        <template v-else-if="view === 'favorites'">
           <div v-if="listLoading" class="empty">加载中…</div>
           <div v-else-if="favorites.length === 0" class="empty">还没有收藏</div>
           <div v-else class="poster-grid">
@@ -974,6 +1129,115 @@ function openHistoryItem(item: ArchiveProgress) {
               <div class="poster-title">{{ item.series_title || item.series_id }}</div>
               <div class="poster-sub">{{ relativeTime(item.updated_at) }}</div>
             </article>
+          </div>
+        </template>
+
+        <!-- 排行榜 -->
+        <template v-else-if="view === 'rank'">
+          <div v-if="rankCategories.length" class="rank-tabs">
+            <button
+              v-for="c in rankCategories"
+              :key="c.id"
+              class="chip"
+              :class="{ active: c.id === rankID }"
+              @click="selectRankCategory(c.id)"
+            >
+              {{ c.name }}
+            </button>
+          </div>
+
+          <div v-if="rankSubs.length" class="rank-subs">
+            <button
+              v-for="s in rankSubs"
+              :key="s.id"
+              class="rank-sub"
+              :class="{ active: s.id === rankSubID }"
+              @click="selectRankSub(s.id)"
+            >
+              {{ s.name }}
+            </button>
+          </div>
+
+          <div v-if="rankSub" class="rank-head">
+            <div>
+              <h2 class="rank-title">{{ rankSub.name }}</h2>
+              <p v-if="rankSub.desc" class="rank-desc">{{ rankSub.desc }}</p>
+            </div>
+            <div v-if="rankGroups.length" class="rank-panel-wrap">
+              <button class="btn-ghost" @click="rankPanelOpen = !rankPanelOpen">
+                {{ rankPanelLabel }} ▾
+              </button>
+              <div v-if="rankPanelOpen" class="rank-panel">
+                <button class="chip" :class="{ active: !rankPanelID }" @click="selectRankPanel('')">
+                  总榜
+                </button>
+                <div v-for="g in rankGroups" :key="g.key" class="rank-group">
+                  <span class="rank-group-name">{{ g.name }}</span>
+                  <button
+                    v-for="o in g.options"
+                    :key="o.id"
+                    class="chip"
+                    :class="{ active: rankPanelID === o.id }"
+                    @click="selectRankPanel(o.id)"
+                  >
+                    {{ o.name }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="rankError" class="empty">{{ rankError }}</div>
+          <div v-else-if="rankBusy && rankItems.length === 0" class="empty">加载榜单…</div>
+          <div v-else-if="rankItems.length === 0" class="empty">这个榜单暂时没有内容</div>
+          <div v-else class="rank-list">
+            <article
+              v-for="(item, idx) in rankItems"
+              :key="item.id"
+              class="rank-item"
+              @click="openRankItem(item)"
+            >
+              <span class="rank-no" :class="{ top: idx < 3 }">{{ idx + 1 }}</span>
+              <img
+                v-if="item.cover"
+                class="rank-cover"
+                :class="{ round: item.person }"
+                :src="item.cover"
+                :alt="item.title"
+                loading="lazy"
+              />
+              <div v-else class="rank-cover placeholder">无图</div>
+              <div class="rank-main">
+                <div class="rank-line">
+                  <span class="rank-name">{{ item.title }}</span>
+                  <span v-if="item.badge" class="badge">{{ item.badge }}</span>
+                </div>
+                <div class="rank-meta">
+                  <span v-if="item.status">{{ item.status }}</span>
+                  <span v-if="item.score > 0 && !item.person" class="rank-score">
+                    {{ item.score }}分
+                  </span>
+                  <span v-for="t in (item.tags || []).slice(0, 3)" :key="t" class="chip mini">
+                    {{ t }}
+                  </span>
+                </div>
+                <div v-if="item.cast?.length" class="rank-subline">
+                  主演: {{ item.cast.join(' / ') }}
+                </div>
+                <div v-if="item.intro" class="rank-intro">{{ item.intro }}</div>
+                <div class="rank-value">
+                  <span v-if="item.rank_text" class="rank-heat">{{ item.rank_text }}</span>
+                  <span v-if="item.sub_info" class="rank-subline">{{ item.sub_info }}</span>
+                </div>
+              </div>
+              <span v-if="item.upcoming" class="chip" style="cursor: default">待播</span>
+            </article>
+          </div>
+
+          <div v-if="rankHasMore" class="loading-more">
+            <button class="btn-ghost" :disabled="rankBusy" @click="loadMoreRank">
+              {{ rankBusy ? '加载中…' : '加载更多' }}
+            </button>
           </div>
         </template>
       </main>

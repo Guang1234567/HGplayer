@@ -141,6 +141,60 @@ export interface PlayInfo {
   definition?: string;
 }
 
+/** 榜单筛选项。 */
+export interface RankFilterOption {
+  id: string;
+  name: string;
+}
+
+/** 榜单筛选项分组。 */
+export interface RankFilterGroup {
+  key: string;
+  name: string;
+  options: RankFilterOption[];
+}
+
+/** 子榜单。 */
+export interface RankSub {
+  id: string;
+  name: string;
+  desc: string;
+  panel: RankFilterGroup[];
+}
+
+/** 榜单分类。 */
+export interface RankCategory {
+  id: string;
+  name: string;
+  subs: RankSub[];
+}
+
+/** 榜单条目。 */
+export interface RankItem {
+  id: string;
+  title: string;
+  cover: string;
+  episode_count: number;
+  score: number;
+  status: string;
+  badge?: string;
+  rank_text?: string;
+  tags: string[];
+  cast?: string[];
+  intro?: string;
+  sub_info?: string;
+  person?: boolean;
+  upcoming?: boolean;
+  reserved?: boolean;
+}
+
+/** 榜单分页。 */
+export interface RankPage {
+  items: RankItem[];
+  cursor: string;
+  has_more: boolean;
+}
+
 /** 观看进度（档案包）。 */
 export interface ArchiveProgress {
   series_id: string;
@@ -185,6 +239,18 @@ export const api = {
     request<SearchResult>(`/api/search?q=${encodeURIComponent(keyword)}&page=${page}`),
   series: (id: string) => request<SeriesDetail>(`/api/series/${encodeURIComponent(id)}`),
   play: (vid: string) => request<PlayInfo>(`/api/play/${encodeURIComponent(vid)}`),
+
+  // 排行榜：分类选择器 + 榜单分页（cursor 由后端生成，原样回传）
+  rankPanel: () => request<{ categories: RankCategory[] }>('/api/rank/panel'),
+  rank: (selection: { rank: string; rank_sub: string; rank_panel?: string; cursor?: string }) => {
+    const params = new URLSearchParams({
+      rank: selection.rank,
+      rank_sub: selection.rank_sub,
+    });
+    if (selection.rank_panel) params.set('rank_panel', selection.rank_panel);
+    if (selection.cursor) params.set('cursor', selection.cursor);
+    return request<RankPage>(`/api/rank?${params.toString()}`);
+  },
 
   // 档案包
   history: () => request<{ history: ArchiveProgress[] }>('/api/archive/history'),
