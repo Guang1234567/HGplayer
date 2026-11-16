@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"hgplayer/internal/cenc"
 	"hgplayer/internal/cenc/cenctest"
@@ -364,4 +367,76 @@ type countingResolver struct {
 func (c *countingResolver) ResolveStream(context.Context, string) (StreamSource, error) {
 	c.count++
 	return StreamSource{URL: c.base + "/m.mp4?t=fresh", Encrypted: true}, nil
+}
+
+// TestGetUpstreamAnyRaceWinnerReadable 竞速取先到者，且胜出响应体可正常读完。
+func TestGetUpstreamAnyRaceWinnerReadable(t *testing.T) {
+	var fastHits, slowHits atomic.Int32
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastHits.Add(1)
+		body := []byte("FAST")
+		w.Header().Set("Content-Range", "bytes 0-3/4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(fast.Close)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowHits.Add(1)
+		time.Sleep(300 * time.Millisecond)
+		body := []byte("SLOW")
+		w.Header().Set("Content-Range", "bytes 0-3/4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(slow.Close)
+
+	proxy := NewProxy(stubResolver{})
+	proxy.allowHost = func(string) bool { return true }
+
+	src := StreamSource{URL: slow.URL + "/m.mp4", Alternatives: []string{fast.URL + "/m.mp4"}}
+	resp, err := proxy.getUpstreamAny(context.Background(), src, "bytes=0-3")
+	if err != nil {
+		t.Fatalf("getUpstreamAny: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取胜出响应体失败: %v", err)
+	}
+	if string(body) != "FAST" {
+		t.Fatalf("响应体 = %q, want FAST（应取先到的节点）", body)
+	}
+	// 慢节点在被取消前可能还没进到 handler（连接被提前关闭），因此只要求
+	// 快节点被命中；竞速本身由「必须取到 FAST 而不是 SLOW」来保证。
+	if fastHits.Load() == 0 {
+		t.Fatal("快节点未被命中")
+	}
+	_ = slowHits.Load()
+}
+
+// TestFetchRangeRotatesOnUpstreamError 上游失败时换候选重试。
+func TestFetchRangeRotatesOnUpstreamError(t *testing.T) {
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(broken.Close)
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte("0123456789")
+		w.Header().Set("Content-Range", "bytes 0-9/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(healthy.Close)
+
+	proxy := NewProxy(stubResolver{})
+	proxy.allowHost = func(string) bool { return true }
+	src := StreamSource{URL: broken.URL + "/m.mp4", Alternatives: []string{healthy.URL + "/m.mp4"}}
+
+	got, err := proxy.fetchRange(context.Background(), "123", src, 0, 10)
+	if err != nil {
+		t.Fatalf("fetchRange: %v", err)
+	}
+	if string(got) != "0123456789" {
+		t.Fatalf("内容 = %q", got)
+	}
 }

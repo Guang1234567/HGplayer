@@ -128,7 +128,7 @@ func newApp() (*app, error) {
 		Logger:       logger,
 		ArchiveDir:   dirs.Data,
 		Proto:        proto,
-		MediaProxy:   media.NewProxy(streamResolver{proto: proto}),
+		MediaProxy:   media.NewProxy(streamResolver{proto: proto}, media.WithLogger(logger)),
 	}, signer)
 
 	return &app{dirs: dirs, logger: logger, svc: svc}, nil
@@ -146,10 +146,19 @@ func (s streamResolver) ResolveStream(ctx context.Context, vid string) (media.St
 		return media.StreamSource{}, err
 	}
 	return media.StreamSource{
-		URL:        info.URL,
-		Encrypted:  info.Encrypted,
-		ContentKey: info.ContentKey,
+		URL:          info.URL,
+		Alternatives: backupURLs(info),
+		Encrypted:    info.Encrypted,
+		ContentKey:   info.ContentKey,
 	}, nil
+}
+
+// backupURLs 收集备用片源地址（同一集的其它 CDN 节点）。
+func backupURLs(info *hgproto.PlayInfo) []string {
+	if info.BackupURL == "" || info.BackupURL == info.URL {
+		return nil
+	}
+	return []string{info.BackupURL}
 }
 
 // assetHandler 组装前端静态资源 + 同源 /api、/media 的 Handler。

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"hgplayer/internal/cenc"
 )
@@ -30,6 +31,8 @@ const (
 	plainWindowBytes = 256 << 10
 	// windowCacheMaxBytes 是明文窗口缓存的总字节上限。
 	windowCacheMaxBytes = 64 << 20
+	// plainWindowAhead 是在途窗口数：上游往返与解密靠它重叠。
+	plainWindowAhead = 6
 )
 
 // planCache 按 vid 缓存解密布局（含明文前缀）。
@@ -163,33 +166,55 @@ func (c *windowCache) removeLocked(vid string) {
 	}
 }
 
+// logf 返回日志器；未注入时使用空实现。
+func (p *Proxy) logf() Logger {
+	if p.logger != nil {
+		return p.logger
+	}
+	return nopLogger{}
+}
+
+// nopLogger 丢弃全部日志。
+type nopLogger struct{}
+
+// Info 实现 Logger。
+func (nopLogger) Info(string, ...any) {}
+
+// Warn 实现 Logger。
+func (nopLogger) Warn(string, ...any) {}
+
 // planFor 解析片源的解密布局（必要时探测头部窗口）。
 //
 // 返回的 whole 非空表示上游不支持 Range，调用方应改用整段解密。
 // 无法窗口化的片源会缓存 nil 布局，避免每个请求都重新探测。
 func (p *Proxy) planFor(ctx context.Context, vid string, src StreamSource) (*cenc.Plan, []byte, error) {
-	fingerprint := mediaFingerprint(src.URL, src.ContentKey)
+	fingerprint := mediaFingerprint(src.fingerprintSeed(), src.ContentKey)
 	if plan, ok := p.plans.get(vid, fingerprint); ok {
 		return plan, nil, nil
 	}
 
 	window := int64(planProbeWindow)
 	for {
-		head, total, ranged, whole, err := p.probe(ctx, src.URL, window)
+		head, total, ranged, whole, err := p.probe(ctx, src, window)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !ranged {
 			p.plans.put(vid, fingerprint, nil)
+			p.logf().Warn("媒体退回整段解密", "vid", vid, "原因", "上游不支持 Range")
 			return nil, whole, nil
 		}
 		plan, err := cenc.BuildPlan(head, total)
 		if err == nil {
 			p.plans.put(vid, fingerprint, plan)
+			p.logf().Info("媒体窗口式解密就绪",
+				"vid", vid, "总字节", total, "前缀", len(plan.Prefix),
+				"样本数", len(plan.Samples), "探测窗口", window)
 			return plan, nil, nil
 		}
 		if !errors.Is(err, cenc.ErrNeedMoreHead) || window >= total || window >= planProbeMax {
 			p.plans.put(vid, fingerprint, nil)
+			p.logf().Warn("媒体退回整段解密", "vid", vid, "原因", err.Error())
 			return nil, nil, err
 		}
 		window *= 2
@@ -199,8 +224,8 @@ func (p *Proxy) planFor(ctx context.Context, vid string, src StreamSource) (*cen
 // probe 取头部窗口；返回明文布局所需的头部字节与文件总长。
 //
 // 上游忽略 Range（返回 200）时 ranged 为 false，并返回整段内容。
-func (p *Proxy) probe(ctx context.Context, target string, size int64) (head []byte, total int64, ranged bool, whole []byte, err error) {
-	resp, err := p.getUpstream(ctx, target, fmt.Sprintf("bytes=0-%d", size-1))
+func (p *Proxy) probe(ctx context.Context, src StreamSource, size int64) (head []byte, total int64, ranged bool, whole []byte, err error) {
+	resp, err := p.getUpstreamAny(ctx, src, fmt.Sprintf("bytes=0-%d", size-1))
 	if err != nil {
 		return nil, 0, false, nil, err
 	}
@@ -247,10 +272,13 @@ func parseContentRangeTotal(value string) (int64, error) {
 	return total, nil
 }
 
-// getUpstream 发起一次上游请求（自动跟随有限次重定向并校验收敛后的域名）。
-func (p *Proxy) getUpstream(ctx context.Context, target string, rangeHeader string) (*http.Response, error) {
+// openUpstream 发起一次上游请求（自动跟随有限次重定向并校验收敛后的域名）。
+//
+// openCtx 只约束「拿到响应头」这一步；拿到后响应体的读取改由 readCtx 约束，
+// 这样竞速时可以安全地取消落败分支，而胜出分支继续按请求生命周期读取。
+func (p *Proxy) openUpstream(readCtx, openCtx context.Context, target string, rangeHeader string) (*http.Response, error) {
 	for hop := 0; hop <= maxRedirects; hop++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		req, err := http.NewRequestWithContext(openCtx, http.MethodGet, target, nil)
 		if err != nil {
 			return nil, fmt.Errorf("构造上游请求失败: %w", err)
 		}
@@ -274,9 +302,93 @@ func (p *Proxy) getUpstream(ctx context.Context, target string, rangeHeader stri
 			target = next
 			continue
 		}
+		// 响应体改由调用方 ctx 约束。
+		resp.Body = &contextBody{ReadCloser: resp.Body, ctx: readCtx}
 		return resp, nil
 	}
 	return nil, errors.New("上游媒体重定向次数过多")
+}
+
+// contextBody 让响应体的读取跟随给定 ctx（关闭时一并释放）。
+type contextBody struct {
+	io.ReadCloser
+	ctx context.Context
+}
+
+// Read 实现 io.Reader。
+func (b *contextBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return b.ReadCloser.Read(p)
+}
+
+// getUpstream 发起一次上游请求（打开与读取都用同一个 ctx）。
+func (p *Proxy) getUpstream(ctx context.Context, target string, rangeHeader string) (*http.Response, error) {
+	return p.openUpstream(ctx, ctx, target, rangeHeader)
+}
+
+// getUpstreamAny 在多个候选地址间竞速，返回最先成功（且未 4xx/5xx）的响应。
+//
+// 同一集通常有 2~3 个 CDN 节点，实测节点间带宽可差 2 倍以上，
+// 因此不固定节点，而是让各候选同时起跑、取先到者。落败分支立即取消，
+// 胜出分支的取消动作绑定到响应体 Close（避免 ctx 泄漏）。
+func (p *Proxy) getUpstreamAny(ctx context.Context, src StreamSource, rangeHeader string) (*http.Response, error) {
+	urls := src.urls()
+	if len(urls) == 0 {
+		return nil, errors.New("片源地址缺失")
+	}
+	if len(urls) == 1 {
+		return p.getUpstream(ctx, urls[0], rangeHeader)
+	}
+
+	type candidate struct {
+		resp *http.Response
+		err  error
+	}
+	results := make(chan candidate, len(urls))
+	for _, target := range urls {
+		go func(target string) {
+			// 每个候选各自派生 ctx，便于单独取消；正常完成时在 Close 里回收。
+			candidateCtx, cancel := context.WithCancel(ctx)
+			resp, err := p.openUpstream(candidateCtx, candidateCtx, target, rangeHeader)
+			if err == nil && resp.StatusCode >= 400 {
+				resp.Body.Close()
+				err = fmt.Errorf("上游媒体返回 HTTP %d", resp.StatusCode)
+			}
+			if err != nil {
+				cancel()
+				results <- candidate{err: err}
+				return
+			}
+			resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+			results <- candidate{resp: resp}
+		}(target)
+	}
+
+	var lastErr error
+	for i := 0; i < len(urls); i++ {
+		got := <-results
+		if got.err != nil {
+			lastErr = got.err
+			continue
+		}
+		return got.resp, nil
+	}
+	return nil, lastErr
+}
+
+// cancelBody 在关闭响应体时回收它所属候选的 ctx。
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close 关闭响应体并释放候选 ctx。
+func (b *cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // fetchRange 取上游 [u0, u1) 的原始字节（不会返回超出该区间的数据）。
@@ -284,76 +396,114 @@ func (p *Proxy) fetchRange(ctx context.Context, vid string, src StreamSource, u0
 	if u1 <= u0 {
 		return nil, nil
 	}
-	target := src.URL
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := p.getUpstream(ctx, target, fmt.Sprintf("bytes=%d-%d", u0, u1-1))
+		resp, err := p.getUpstreamAny(ctx, src, fmt.Sprintf("bytes=%d-%d", u0, u1-1))
 		if err != nil {
 			lastErr = err
-			break
-		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			lastErr = readErr
-			break
-		}
-		switch resp.StatusCode {
-		case http.StatusPartialContent:
-			if int64(len(body)) != u1-u0 {
-				return nil, errors.New("上游返回长度与请求区间不一致")
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			switch {
+			case readErr != nil:
+				lastErr = readErr
+			case resp.StatusCode == http.StatusPartialContent:
+				if int64(len(body)) != u1-u0 {
+					return nil, errors.New("上游返回长度与请求区间不一致")
+				}
+				return body, nil
+			case resp.StatusCode == http.StatusOK:
+				// 上游忽略 Range：从整段里截取所需区间。
+				if int64(len(body)) < u1 {
+					return nil, errors.New("上游返回长度与请求区间不一致")
+				}
+				return body[u0:u1], nil
+			default:
+				lastErr = fmt.Errorf("上游媒体返回 HTTP %d", resp.StatusCode)
 			}
-			return body, nil
-		case http.StatusOK:
-			// 上游忽略 Range：从整段里截取所需区间。
-			if int64(len(body)) < u1 {
-				return nil, errors.New("上游返回长度与请求区间不一致")
-			}
-			return body[u0:u1], nil
-		default:
-			lastErr = fmt.Errorf("上游媒体返回 HTTP %d", resp.StatusCode)
 		}
 		// 地址可能已过期：重新取址后重试一次。
 		refreshed, err := p.resolve.ResolveStream(ctx, vid)
 		if err != nil || !p.allow(refreshed.URL) {
 			break
 		}
-		target = refreshed.URL
+		src = refreshed
 	}
 	return nil, lastErr
 }
 
 // window 返回某个明文窗口的内容（命中缓存时不再请求上游）。
+//
+// 同一窗口的并发请求合并成一次抓取；不同窗口之间并行。
 func (p *Proxy) window(ctx context.Context, vid string, src StreamSource, plan *cenc.Plan, key []byte, index int64) ([]byte, error) {
-	fingerprint := mediaFingerprint(src.URL, src.ContentKey)
+	fingerprint := mediaFingerprint(src.fingerprintSeed(), src.ContentKey)
 	if data, ok := p.windows.get(vid, fingerprint, index); ok {
 		return data, nil
 	}
 
-	// 同一片源的窗口抓取串行化，避免并发请求重复下载。
-	p.fetchMu.Lock()
-	defer p.fetchMu.Unlock()
-	if data, ok := p.windows.get(vid, fingerprint, index); ok {
-		return data, nil
+	p.inflightMu.Lock()
+	if p.inflight == nil {
+		p.inflight = make(map[windowKey]*windowFlight)
+	}
+	key2 := windowKey{vid: vid, index: index}
+	if flight, ok := p.inflight[key2]; ok {
+		p.inflightMu.Unlock()
+		<-flight.done
+		return flight.data, flight.err
+	}
+	flight := &windowFlight{done: make(chan struct{})}
+	p.inflight[key2] = flight
+	p.inflightMu.Unlock()
+
+	finish := func(data []byte, err error) {
+		flight.data, flight.err = data, err
+		p.inflightMu.Lock()
+		delete(p.inflight, key2)
+		p.inflightMu.Unlock()
+		close(flight.done)
 	}
 
 	start := index * plainWindowBytes
 	end := min(start+plainWindowBytes, plan.PlainSize())
 	if end <= start {
-		return nil, errors.New("明文窗口越界")
+		finish(nil, errors.New("明文窗口越界"))
+		return nil, flight.err
 	}
 	fetch := func(u0, u1 int64) ([]byte, error) {
 		return p.fetchRange(ctx, vid, src, u0, u1)
 	}
+	started := time.Now()
 	data, err := plan.ReadWindow(key, start, end, fetch)
 	if err != nil {
+		finish(nil, err)
 		return nil, err
 	}
+	if index == 0 {
+		p.logf().Info("媒体首窗口就绪",
+			"vid", vid, "字节", len(data), "耗时", time.Since(started).Round(time.Millisecond).String())
+	}
 	p.windows.put(vid, fingerprint, index, data)
+	finish(data, nil)
 	return data, nil
 }
 
-// serveWindows 按明文窗口把响应流式写出（只取缺失窗口）。
+// windowKey 标识一份片源的一个明文窗口。
+type windowKey struct {
+	vid   string
+	index int64
+}
+
+// windowFlight 是一次在途的窗口抓取。
+type windowFlight struct {
+	data []byte
+	err  error
+	done chan struct{}
+}
+
+// serveWindows 按明文窗口把响应流式写出。
+//
+// 窗口抓取走流水线：先并发预取前几个窗口，之后每消费一个窗口就补一个，
+// 让上游往返与解密重叠；每个窗口写出后立即 flush，让内核尽早拿到可播数据。
 func (p *Proxy) serveWindows(w http.ResponseWriter, r *http.Request, vid string, src StreamSource, plan *cenc.Plan, key []byte) error {
 	total := plan.PlainSize()
 	start, end, status := int64(0), total-1, http.StatusOK
@@ -370,29 +520,81 @@ func (p *Proxy) serveWindows(w http.ResponseWriter, r *http.Request, vid string,
 	w.WriteHeader(status)
 
 	ctx := r.Context()
+	flusher, _ := w.(http.Flusher)
+
+	first := start / plainWindowBytes
+	last := end / plainWindowBytes
+	pending := make(map[int64]*windowFetch, plainWindowAhead)
+	order := make([]int64, 0, plainWindowAhead)
+
+	// schedule 预取窗口 index（已调度过则跳过）。
+	schedule := func(index int64) {
+		if index > last || index < first {
+			return
+		}
+		if _, exists := pending[index]; exists {
+			return
+		}
+		fetch := &windowFetch{done: make(chan struct{})}
+		pending[index] = fetch
+		order = append(order, index)
+		go func() {
+			data, err := p.window(ctx, vid, src, plan, key, index)
+			fetch.data, fetch.err = data, err
+			close(fetch.done)
+		}()
+	}
+
+	for index := first; index <= last && index < first+plainWindowAhead; index++ {
+		schedule(index)
+	}
+
 	for at := start; at <= end; {
 		index := at / plainWindowBytes
-		windowStart := index * plainWindowBytes
-		data, err := p.window(ctx, vid, src, plan, key, index)
-		if err != nil {
+		fetch, ok := pending[index]
+		if !ok {
+			schedule(index)
+			fetch = pending[index]
+		}
+		<-fetch.done
+		delete(pending, index)
+		for i, key := range order {
+			if key == index {
+				order = append(order[:i], order[i+1:]...)
+				break
+			}
+		}
+		// 每消费一个窗口就补一个，保持流水线满载。
+		schedule(index + plainWindowAhead)
+
+		if fetch.err != nil {
 			if ctx.Err() != nil {
-				// 客户端断开，响应无需继续。
 				return nil
 			}
-			return fmt.Errorf("%w: %v", ErrResponseStarted, err)
+			return fmt.Errorf("%w: %v", ErrResponseStarted, fetch.err)
 		}
+		windowStart := index * plainWindowBytes
 		from := at - windowStart
-		to := min(end, windowStart+int64(len(data))-1) - windowStart + 1
-		if from < 0 || to > int64(len(data)) || from >= to {
+		to := min(end, windowStart+int64(len(fetch.data))-1) - windowStart + 1
+		if from < 0 || to > int64(len(fetch.data)) || from >= to {
 			return fmt.Errorf("%w: 明文窗口与请求区间不匹配", ErrResponseStarted)
 		}
-		if _, err := w.Write(data[from:to]); err != nil {
-			// 客户端断开：不再视作错误。
+		if _, err := w.Write(fetch.data[from:to]); err != nil {
 			return nil
+		}
+		if flusher != nil {
+			flusher.Flush()
 		}
 		at = windowStart + to
 	}
 	return nil
+}
+
+// windowFetch 是一条在途的窗口抓取。
+type windowFetch struct {
+	data []byte
+	err  error
+	done chan struct{}
 }
 
 // resolveLocation 依据当前地址解析重定向目标。

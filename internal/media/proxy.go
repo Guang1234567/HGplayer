@@ -32,17 +32,55 @@ var ErrResponseStarted = errors.New("响应已开始")
 
 // StreamSource 是解析后的片源。
 type StreamSource struct {
-	// URL 是上游可直连的媒体地址。
+	// URL 是上游可直连的媒体地址（首选）。
 	URL string
+	// Alternatives 是同一片源的其他可用地址（备用 CDN 节点）。
+	Alternatives []string
 	// Encrypted 表示片源受 CENC 保护。
 	Encrypted bool
 	// ContentKey 是解密所需的内容密钥（未实现解密时仅用于诊断）。
 	ContentKey string
 }
 
+// urls 返回全部候选地址（首选在前，去重）。
+func (s StreamSource) urls() []string {
+	out := make([]string, 0, 1+len(s.Alternatives))
+	seen := make(map[string]bool, 1+len(s.Alternatives))
+	for _, candidate := range append([]string{s.URL}, s.Alternatives...) {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
+}
+
+// fingerprintSeed 是用于缓存指纹的稳定标识（取首个地址）。
+func (s StreamSource) fingerprintSeed() string {
+	if urls := s.urls(); len(urls) > 0 {
+		return urls[0]
+	}
+	return ""
+}
+
 // Resolver 解析分集标识到片源。
 type Resolver interface {
 	ResolveStream(ctx context.Context, vid string) (StreamSource, error)
+}
+
+// Logger 是媒体代理使用的可选日志接口（为空时静默）。
+type Logger interface {
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+}
+
+// Option 配置媒体代理。
+type Option func(*Proxy)
+
+// WithLogger 注入日志器，用于记录窗口式/兜底路径选择与关键耗时。
+func WithLogger(logger Logger) Option {
+	return func(p *Proxy) { p.logger = logger }
 }
 
 // Proxy 是单资源 HTTP 反代。
@@ -59,16 +97,19 @@ type Proxy struct {
 	plans *planCache
 	// windows 缓存已解密的明文窗口。
 	windows *windowCache
-	// fetchMu 串行化窗口抓取，避免并发请求重复下载同一区间。
-	fetchMu sync.Mutex
+	// logger 记录路径选择与耗时；可为空。
+	logger Logger
+	// inflightMu 保护 inflight：同一窗口的并发抓取合并成一次。
+	inflightMu sync.Mutex
+	inflight   map[windowKey]*windowFlight
 }
 
 // errNoContentKey 表示加密片源没有可用的内容密钥。
 var errNoContentKey = errors.New("加密片源缺少内容密钥")
 
 // NewProxy 创建媒体代理。
-func NewProxy(resolve Resolver) *Proxy {
-	return &Proxy{
+func NewProxy(resolve Resolver, opts ...Option) *Proxy {
+	proxy := &Proxy{
 		resolve:   resolve,
 		client:    &http.Client{Timeout: 60 * time.Second},
 		decrypt:   cenc.Decrypt,
@@ -77,6 +118,10 @@ func NewProxy(resolve Resolver) *Proxy {
 		plans:     newPlanCache(),
 		windows:   newWindowCache(windowCacheMaxBytes),
 	}
+	for _, opt := range opts {
+		opt(proxy)
+	}
+	return proxy
 }
 
 // maxRedirects 限制重定向跳数，避免代理被用作开放跳板。
@@ -99,7 +144,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, vid string) error 
 		return p.serveEncrypted(w, r, vid, src)
 	}
 
-	resp, err := p.getUpstream(ctx, src.URL, r.Header.Get("Range"))
+	resp, err := p.getUpstreamAny(ctx, src, r.Header.Get("Range"))
 	if err != nil {
 		return err
 	}
@@ -225,7 +270,7 @@ func (p *Proxy) serveEncryptedWhole(w http.ResponseWriter, r *http.Request, vid 
 //
 // prefetched 非空表示调用方已取得整段加密数据（例如上游忽略了 Range 探测）。
 func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, key []byte, prefetched []byte) ([]byte, error) {
-	fingerprint := mediaFingerprint(src.URL, src.ContentKey)
+	fingerprint := mediaFingerprint(src.fingerprintSeed(), src.ContentKey)
 	if cached, ok := p.cache.get(vid, fingerprint); ok {
 		return cached, nil
 	}
@@ -233,7 +278,7 @@ func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, ke
 	cipher := prefetched
 	if cipher == nil {
 		var err error
-		cipher, err = p.fetchAll(ctx, src.URL)
+		cipher, err = p.fetchAll(ctx, src)
 		if err != nil {
 			return nil, err
 		}
@@ -247,8 +292,8 @@ func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, ke
 }
 
 // fetchAll 下载整段加密媒体（不使用 Range）。
-func (p *Proxy) fetchAll(ctx context.Context, target string) ([]byte, error) {
-	resp, err := p.getUpstream(ctx, target, "")
+func (p *Proxy) fetchAll(ctx context.Context, src StreamSource) ([]byte, error) {
+	resp, err := p.getUpstreamAny(ctx, src, "")
 	if err != nil {
 		return nil, err
 	}
