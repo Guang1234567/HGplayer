@@ -36,6 +36,10 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 				Error: "该片源受 CENC 保护，需要解密管线。",
 			})
 			return
+		case errors.Is(err, media.ErrResponseStarted):
+			// 响应已开始（流式供给中途失败）：只能中断连接，不能再写错误响应。
+			s.logger.Warn("媒体流中断", "vid", id, "err", err.Error())
+			return
 		default:
 			s.logger.Warn("媒体代理失败", "vid", id, "err", err.Error())
 			writeJSON(w, http.StatusBadGateway, mediaError{

@@ -1,8 +1,10 @@
 // Package media 承载媒体代理：把上游片源以 HTTP Range 供给浏览器内核。
 //
-// 未加密片源走标准反向代理，Range 原样透传；CENC 加密片源先整段下载、
-// 本地解密（cenc 包），再按 Range 从解密结果回流（短剧单集只有十几 MB，
-// 解密结果按 vid 做小容量 LRU 缓存，避免每次 seek 都重新下载解密）。
+// 未加密片源走标准反向代理，Range 原样透传；CENC 加密片源走窗口式解密：
+// 先用头部窗口（moov）建立「明文 = 上游 + Shift」的布局，再把浏览器请求的区间
+// 映射成上游字节区间，只取需要的部分、只解密覆盖到的样本，并按固定窗口缓存结果
+// （见 window.go）。布局不可用（moov 不在头部、上游不支持 Range）时退回
+// 「整段下载 → 解密 → 按 Range 回流」。
 package media
 
 import (
@@ -24,6 +26,9 @@ import (
 
 // ErrEncrypted 表示片源加密但缺少可用的解密能力（例如没有内容密钥）。
 var ErrEncrypted = errors.New("加密片源缺少解密能力")
+
+// ErrResponseStarted 表示响应已写出，调用方不应再改状态码或改写错误响应。
+var ErrResponseStarted = errors.New("响应已开始")
 
 // StreamSource 是解析后的片源。
 type StreamSource struct {
@@ -50,6 +55,12 @@ type Proxy struct {
 	cache *plainCache
 	// allowHost 校验片源域名；测试可替换。
 	allowHost func(string) bool
+	// plans 缓存窗口式解密的布局。
+	plans *planCache
+	// windows 缓存已解密的明文窗口。
+	windows *windowCache
+	// fetchMu 串行化窗口抓取，避免并发请求重复下载同一区间。
+	fetchMu sync.Mutex
 }
 
 // errNoContentKey 表示加密片源没有可用的内容密钥。
@@ -63,6 +74,8 @@ func NewProxy(resolve Resolver) *Proxy {
 		decrypt:   cenc.Decrypt,
 		cache:     newPlainCache(plainCacheLimit, plainCacheMaxBytes),
 		allowHost: isAllowedMediaURL,
+		plans:     newPlanCache(),
+		windows:   newWindowCache(windowCacheMaxBytes),
 	}
 }
 
@@ -86,46 +99,15 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, vid string) error 
 		return p.serveEncrypted(w, r, vid, src)
 	}
 
-	target := src.URL
-	for hop := 0; hop <= maxRedirects; hop++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return fmt.Errorf("构造上游请求失败: %w", err)
-		}
-		// 透传 Range，支持拖拽 seek。
-		if rg := r.Header.Get("Range"); rg != "" {
-			req.Header.Set("Range", rg)
-		}
-		req.Header.Set("Accept-Encoding", "identity")
-
-		resp, err := p.client.Do(req)
-		if err != nil {
-			return fmt.Errorf("上游媒体请求失败: %w", err)
-		}
-
-		// 跟随重定向（不把 Range 部分响应误判为最终结果）。
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {
-			loc := resp.Header.Get("Location")
-			resp.Body.Close()
-			next, err := url.Parse(loc)
-			if err != nil {
-				return errors.New("上游重定向地址无效")
-			}
-			base, _ := url.Parse(target)
-			target = base.ResolveReference(next).String()
-			if !p.allow(target) {
-				return errors.New("片源地址未通过安全检查")
-			}
-			continue
-		}
-
-		defer resp.Body.Close()
-		copyMediaHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		return nil
+	resp, err := p.getUpstream(ctx, src.URL, r.Header.Get("Range"))
+	if err != nil {
+		return err
 	}
-	return errors.New("上游媒体重定向次数过多")
+	defer resp.Body.Close()
+	copyMediaHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+	return nil
 }
 
 // copyMediaHeaders 只透传媒体相关响应头。
@@ -204,14 +186,31 @@ const (
 	plainCacheMaxBytes = 96 << 20
 )
 
-// serveEncrypted 下载并解密加密片源，再按 Range 回流给客户端。
+// serveEncrypted 供给加密片源。
+//
+// 优先窗口式：探测头部窗口建立布局后，按浏览器请求的区间只取上游对应字节、
+// 只解密覆盖到的样本。布局不可用（moov 不在头部、上游不支持 Range 等）时
+// 退回「整段下载 → 解密 → 按 Range 回流」的老路径。
 func (p *Proxy) serveEncrypted(w http.ResponseWriter, r *http.Request, vid string, src StreamSource) error {
 	key, err := decodeContentKey(src.ContentKey)
 	if err != nil {
 		return err
 	}
 
-	plain, err := p.plainMedia(r.Context(), vid, src, key)
+	plan, prefetched, _ := p.planFor(r.Context(), vid, src)
+	if plan != nil {
+		return p.serveWindows(w, r, vid, src, plan, key)
+	}
+	if ctxErr := r.Context().Err(); ctxErr != nil {
+		return ctxErr
+	}
+	// 布局不可用（moov 不在头部、上游不支持 Range 等）时静默退回整段路径。
+	return p.serveEncryptedWhole(w, r, vid, src, key, prefetched)
+}
+
+// serveEncryptedWhole 整段下载并解密后按 Range 回流（兜底路径）。
+func (p *Proxy) serveEncryptedWhole(w http.ResponseWriter, r *http.Request, vid string, src StreamSource, key []byte, prefetched []byte) error {
+	plain, err := p.plainMedia(r.Context(), vid, src, key, prefetched)
 	if err != nil {
 		return err
 	}
@@ -223,15 +222,21 @@ func (p *Proxy) serveEncrypted(w http.ResponseWriter, r *http.Request, vid strin
 }
 
 // plainMedia 返回解密后的整段媒体（命中缓存时不再请求上游）。
-func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, key []byte) ([]byte, error) {
+//
+// prefetched 非空表示调用方已取得整段加密数据（例如上游忽略了 Range 探测）。
+func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, key []byte, prefetched []byte) ([]byte, error) {
 	fingerprint := mediaFingerprint(src.URL, src.ContentKey)
 	if cached, ok := p.cache.get(vid, fingerprint); ok {
 		return cached, nil
 	}
 
-	cipher, err := p.fetchAll(ctx, src.URL)
-	if err != nil {
-		return nil, err
+	cipher := prefetched
+	if cipher == nil {
+		var err error
+		cipher, err = p.fetchAll(ctx, src.URL)
+		if err != nil {
+			return nil, err
+		}
 	}
 	plain, err := p.decrypt(cipher, key)
 	if err != nil {
@@ -241,42 +246,17 @@ func (p *Proxy) plainMedia(ctx context.Context, vid string, src StreamSource, ke
 	return plain, nil
 }
 
-// fetchAll 下载整段加密媒体（不设 Range）。
+// fetchAll 下载整段加密媒体（不使用 Range）。
 func (p *Proxy) fetchAll(ctx context.Context, target string) ([]byte, error) {
-	for hop := 0; hop <= maxRedirects; hop++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return nil, fmt.Errorf("构造上游请求失败: %w", err)
-		}
-		req.Header.Set("Accept-Encoding", "identity")
-
-		resp, err := p.client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("上游媒体请求失败: %w", err)
-		}
-
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {
-			loc := resp.Header.Get("Location")
-			resp.Body.Close()
-			next, err := url.Parse(loc)
-			if err != nil {
-				return nil, errors.New("上游重定向地址无效")
-			}
-			base, _ := url.Parse(target)
-			target = base.ResolveReference(next).String()
-			if !p.allow(target) {
-				return nil, errors.New("片源地址未通过安全检查")
-			}
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("上游媒体返回 HTTP %d", resp.StatusCode)
-		}
-		defer resp.Body.Close()
-		return io.ReadAll(resp.Body)
+	resp, err := p.getUpstream(ctx, target, "")
+	if err != nil {
+		return nil, err
 	}
-	return nil, errors.New("上游媒体重定向次数过多")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("上游媒体返回 HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 // decodeContentKey 解析内容密钥（十六进制，16 字节）。
