@@ -423,7 +423,7 @@ func (p *Proxy) fetchRange(ctx context.Context, vid string, src StreamSource, u0
 			}
 		}
 		// 地址可能已过期：重新取址后重试一次。
-		refreshed, err := p.resolve.ResolveStream(ctx, vid)
+		refreshed, err := p.resolveStream(ctx, vid)
 		if err != nil || !p.allow(refreshed.URL) {
 			break
 		}

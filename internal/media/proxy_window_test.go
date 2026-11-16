@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -438,5 +439,88 @@ func TestFetchRangeRotatesOnUpstreamError(t *testing.T) {
 	}
 	if string(got) != "0123456789" {
 		t.Fatalf("内容 = %q", got)
+	}
+}
+
+// flakyResolver 首次解析失败，之后成功；用于验证换设备重取。
+type flakyResolver struct {
+	failures int
+	calls    int
+	src      StreamSource
+}
+
+// ResolveStream 实现 Resolver。
+func (r *flakyResolver) ResolveStream(context.Context, string) (StreamSource, error) {
+	r.calls++
+	if r.calls <= r.failures {
+		return StreamSource{}, errors.New("App 取址不可用：上游返回空响应")
+	}
+	return r.src, nil
+}
+
+// TestServeResolvesAgainAfterRefresh 取址失败时应刷新设备并重取一次。
+func TestServeResolvesAgainAfterRefresh(t *testing.T) {
+	plain := []byte("plain-body-0123456789")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", strconv.Itoa(len(plain)))
+		_, _ = w.Write(plain)
+	}))
+	t.Cleanup(server.Close)
+
+	resolver := &flakyResolver{failures: 1, src: StreamSource{URL: server.URL + "/m.mp4"}}
+	refreshed := 0
+	proxy := NewProxy(resolver, WithRefresher(func(context.Context) error {
+		refreshed++
+		return nil
+	}))
+	proxy.allowHost = func(string) bool { return true }
+
+	rec := httptest.NewRecorder()
+	if err := proxy.Serve(rec, httptest.NewRequest(http.MethodGet, "/media/1", nil), "1"); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if rec.Code != http.StatusOK || rec.Body.String() != string(plain) {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if refreshed != 1 {
+		t.Fatalf("刷新次数 = %d, want 1", refreshed)
+	}
+	if resolver.calls != 2 {
+		t.Fatalf("取址次数 = %d, want 2（失败后重取）", resolver.calls)
+	}
+}
+
+// TestServeRefreshFailurePropagates 重取仍失败时返回错误（不再无限重试）。
+func TestServeRefreshFailurePropagates(t *testing.T) {
+	resolver := &flakyResolver{failures: 5, src: StreamSource{URL: "https://example.com/m.mp4"}}
+	refreshed := 0
+	proxy := NewProxy(resolver, WithRefresher(func(context.Context) error {
+		refreshed++
+		return nil
+	}))
+	proxy.allowHost = func(string) bool { return true }
+
+	rec := httptest.NewRecorder()
+	err := proxy.Serve(rec, httptest.NewRequest(http.MethodGet, "/media/1", nil), "1")
+	if err == nil {
+		t.Fatal("重取仍失败时应返回错误")
+	}
+	if refreshed != 1 {
+		t.Fatalf("刷新次数 = %d, want 1（只重取一次）", refreshed)
+	}
+}
+
+// TestServeWithoutRefresherFailsFast 未注入刷新钩子时不重试。
+func TestServeWithoutRefresherFailsFast(t *testing.T) {
+	resolver := &flakyResolver{failures: 5, src: StreamSource{URL: "https://example.com/m.mp4"}}
+	proxy := NewProxy(resolver)
+	proxy.allowHost = func(string) bool { return true }
+
+	if err := proxy.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/media/1", nil), "1"); err == nil {
+		t.Fatal("应返回取址错误")
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("取址次数 = %d, want 1", resolver.calls)
 	}
 }

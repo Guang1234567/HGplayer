@@ -83,6 +83,17 @@ func WithLogger(logger Logger) Option {
 	return func(p *Proxy) { p.logger = logger }
 }
 
+// Refresher 在取址失败时刷新设备身份（注册新设备），供媒体代理重取片源。
+//
+// 上游取址接口会偶发返回 HTTP 200 + 空响应（平台按设备限流），
+// 此时同一设备重试没有意义；换一台新注册的设备通常即可恢复。
+type Refresher func(ctx context.Context) error
+
+// WithRefresher 注入取址失败时的设备刷新钩子。
+func WithRefresher(refresh Refresher) Option {
+	return func(p *Proxy) { p.refresh = refresh }
+}
+
 // Proxy 是单资源 HTTP 反代。
 type Proxy struct {
 	resolve Resolver
@@ -99,6 +110,8 @@ type Proxy struct {
 	windows *windowCache
 	// logger 记录路径选择与耗时；可为空。
 	logger Logger
+	// refresh 在取址失败时刷新设备身份；可为空。
+	refresh Refresher
 	// inflightMu 保护 inflight：同一窗口的并发抓取合并成一次。
 	inflightMu sync.Mutex
 	inflight   map[windowKey]*windowFlight
@@ -124,6 +137,32 @@ func NewProxy(resolve Resolver, opts ...Option) *Proxy {
 	return proxy
 }
 
+// resolveStream 解析片源；首次失败时换一台设备后重试一次。
+//
+// 上游取址会偶发 HTTP 200 + 空响应（平台按设备限流）。同一设备重试无效，
+// 因此刷新设备身份后再取一次地址，避免整次播放直接 502。
+func (p *Proxy) resolveStream(ctx context.Context, vid string) (StreamSource, error) {
+	src, err := p.resolve.ResolveStream(ctx, vid)
+	if err == nil || p.refresh == nil {
+		return src, err
+	}
+	if ctx.Err() != nil {
+		return StreamSource{}, err
+	}
+
+	p.logf().Warn("媒体取址失败，换设备重取", "vid", vid, "err", err.Error())
+	if refreshErr := p.refresh(ctx); refreshErr != nil {
+		p.logf().Warn("刷新设备身份失败", "vid", vid, "err", refreshErr.Error())
+		return StreamSource{}, err
+	}
+	retried, retryErr := p.resolve.ResolveStream(ctx, vid)
+	if retryErr != nil {
+		return StreamSource{}, retryErr
+	}
+	p.logf().Info("换设备后取址成功", "vid", vid)
+	return retried, nil
+}
+
 // maxRedirects 限制重定向跳数，避免代理被用作开放跳板。
 const maxRedirects = 4
 
@@ -133,7 +172,7 @@ const maxRedirects = 4
 func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, vid string) error {
 	ctx := r.Context()
 
-	src, err := p.resolve.ResolveStream(ctx, vid)
+	src, err := p.resolveStream(ctx, vid)
 	if err != nil {
 		return err
 	}

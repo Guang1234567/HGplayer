@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"hgplayer/internal/guard"
@@ -26,10 +27,12 @@ type Client struct {
 	// up 会自动注入播放器签名头（x-ladon/x-argus 等）。
 	up *upstream.Client
 	// upRaw 不注入签名头，用于自建头部（元数据 / 搜索）的请求。
-	upRaw  *upstream.Client
-	device Device
-	signer sign.Signer
-	guard  *guard.Guard
+	upRaw *upstream.Client
+	// deviceMu 保护 device 与两条上游通道：媒体窗口并发抓取时可能同时换设备。
+	deviceMu sync.RWMutex
+	device   Device
+	signer   sign.Signer
+	guard    *guard.Guard
 
 	// 端点（可覆盖，便于测试）。
 	videoAPI         string
@@ -87,30 +90,51 @@ func NewClient(signer sign.Signer, device Device, opts ...Option) *Client {
 	return c
 }
 
-// rebuildClients 按给定守卫重建两条上游通道。
+// rebuildClients 按给定守卫用当前设备身份重建两条上游通道。
+//
+// 通道内嵌了构造时的 device_id/iid，因此换设备时必须重建；重建与读取
+// 用同一把锁串行化，避免请求读到半更新的通道。
 func (c *Client) rebuildClients(g *guard.Guard) {
-	c.up = upstream.New(upstream.Options{
-		Guard: g, Signer: c.signer, DeviceID: c.device.DeviceID, IID: c.device.IID, Timeout: 15 * time.Second,
+	device := c.currentDevice()
+	signed := upstream.New(upstream.Options{
+		Guard: g, Signer: c.signer, DeviceID: device.DeviceID, IID: device.IID, Timeout: 15 * time.Second,
 	})
-	c.upRaw = upstream.New(upstream.Options{
-		Guard: g, DeviceID: c.device.DeviceID, IID: c.device.IID, Timeout: 15 * time.Second,
+	raw := upstream.New(upstream.Options{
+		Guard: g, DeviceID: device.DeviceID, IID: device.IID, Timeout: 15 * time.Second,
 	})
+	c.deviceMu.Lock()
+	c.up, c.upRaw = signed, raw
+	c.deviceMu.Unlock()
+}
+
+// signedUpstream 返回注入播放器签名的通道（并发安全）。
+func (c *Client) signedUpstream() *upstream.Client {
+	c.deviceMu.RLock()
+	defer c.deviceMu.RUnlock()
+	return c.up
+}
+
+// rawUpstream 返回不注入签名的通道（并发安全）。
+func (c *Client) rawUpstream() *upstream.Client {
+	c.deviceMu.RLock()
+	defer c.deviceMu.RUnlock()
+	return c.upRaw
 }
 
 // doJSON 发起上游请求（自动注入播放器签名头）并解析 JSON 响应。
 func (c *Client) doJSON(ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
-	return c.doJSONWith(c.up, ctx, method, target, body, headers)
+	return c.doJSONWith(c.signedUpstream(), ctx, method, target, body, headers)
 }
 
 // doJSONRaw 发起上游请求（不注入签名头，由调用方自建头部）并解析 JSON。
 func (c *Client) doJSONRaw(ctx context.Context, method, target string, body []byte, headers map[string]string) (map[string]any, error) {
-	return c.doJSONWith(c.upRaw, ctx, method, target, body, headers)
+	return c.doJSONWith(c.rawUpstream(), ctx, method, target, body, headers)
 }
 
 // doRawBody 取原始响应体（不解析 JSON），用于官网服务端渲染页面。
 func (c *Client) doRawBody(ctx context.Context, target string, headers map[string]string) ([]byte, error) {
 	resp, err := upstream.DoWithRetry(ctx, func(ctx context.Context) (*upstream.Response, error) {
-		return c.upRaw.Do(ctx, upstream.Request{
+		return c.rawUpstream().Do(ctx, upstream.Request{
 			Method:  http.MethodGet,
 			URL:     target,
 			Query:   queryOf(target),
@@ -169,4 +193,22 @@ func queryOf(rawURL string) string {
 func timestamp() int64 { return time.Now().Unix() }
 
 // SetDevice 替换客户端使用的设备身份（注册新设备后调用）。
-func (c *Client) SetDevice(device Device) { c.device = device }
+func (c *Client) SetDevice(device Device) { c.setDevice(device) }
+
+// currentDevice 返回当前设备身份（并发安全）。
+func (c *Client) currentDevice() Device {
+	c.deviceMu.RLock()
+	defer c.deviceMu.RUnlock()
+	return c.device
+}
+
+// setDevice 替换当前设备身份（并发安全）。
+//
+// 两条上游通道在构造时就固定了 device_id/iid（请求头与签名要用），
+// 因此换设备后必须重建，否则后续请求仍带着旧身份。
+func (c *Client) setDevice(device Device) {
+	c.deviceMu.Lock()
+	c.device = device
+	c.deviceMu.Unlock()
+	c.rebuildClients(c.guard)
+}

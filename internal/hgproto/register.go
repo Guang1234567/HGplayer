@@ -87,7 +87,7 @@ func (c *Client) RegisterDevice(ctx context.Context) (Device, error) {
 	}
 
 	// 注册走不带播放签名的通道。
-	resp, err := c.upRaw.Do(ctx, upstream.Request{
+	resp, err := c.rawUpstream().Do(ctx, upstream.Request{
 		Method: http.MethodPost, URL: target, Headers: headers, Body: body,
 	})
 	if err != nil {

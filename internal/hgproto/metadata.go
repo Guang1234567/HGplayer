@@ -99,9 +99,9 @@ func (c *Client) metadataDeviceOrdered() []kv {
 		{"need_personal_recommend", "1"},
 		{"player_so_load", "1"},
 		{"is_android_pad_screen", "0"},
-		{"iid", c.device.IID},
-		{"device_id", c.device.DeviceID},
-		{"cdid", c.device.CDID},
+		{"iid", c.currentDevice().IID},
+		{"device_id", c.currentDevice().DeviceID},
+		{"cdid", c.currentDevice().CDID},
 	}
 }
 
@@ -148,7 +148,7 @@ func (c *Client) metadataSigned(apiPath string, values []kv, payload []byte) (st
 		"x-tt-dt":               "",
 	}
 	if medusa, err := sign.Medusa(target, payload, khronos, sign.MedusaDevice{
-		DeviceID:    c.device.DeviceID,
+		DeviceID:    c.currentDevice().DeviceID,
 		VersionName: metadataVersionName,
 	}, sign.DefaultMedusaOptions()); err == nil {
 		headers["x-medusa"] = string(medusa)

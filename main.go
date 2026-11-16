@@ -107,19 +107,22 @@ func newApp() (*app, error) {
 
 	signer := sign.PlayerSigner{}
 	var proto *hgproto.Client
+	// registerDevice 注册一台新设备并替换当前身份（同时持久化）。
+	registerDevice := func(ctx context.Context) (hgproto.Device, error) {
+		fresh, err := proto.RegisterDevice(ctx)
+		if err != nil {
+			return hgproto.Device{}, err
+		}
+		if saveErr := device.Save(dirs.Data, deviceInfoOf(fresh)); saveErr != nil {
+			logger.Warn("保存新设备身份失败", "err", saveErr)
+		}
+		proto.SetDevice(fresh)
+		logger.Info("已注册新的匿名设备", "device_id", fresh.DeviceID)
+		return fresh, nil
+	}
 	proto = hgproto.NewClient(signer, deviceOf(info),
 		// 取址被平台按设备限流时注册一台新设备，并持久化。
-		hgproto.WithDeviceRegistrar(func(ctx context.Context) (hgproto.Device, error) {
-			fresh, err := proto.RegisterDevice(ctx)
-			if err != nil {
-				return hgproto.Device{}, err
-			}
-			if saveErr := device.Save(dirs.Data, deviceInfoOf(fresh)); saveErr != nil {
-				logger.Warn("保存新设备身份失败", "err", saveErr)
-			}
-			logger.Info("已注册新的匿名设备", "device_id", fresh.DeviceID)
-			return fresh, nil
-		}),
+		hgproto.WithDeviceRegistrar(registerDevice),
 	)
 
 	svc := server.New(server.Config{
@@ -128,7 +131,14 @@ func newApp() (*app, error) {
 		Logger:       logger,
 		ArchiveDir:   dirs.Data,
 		Proto:        proto,
-		MediaProxy:   media.NewProxy(streamResolver{proto: proto}, media.WithLogger(logger)),
+		MediaProxy: media.NewProxy(streamResolver{proto: proto},
+			media.WithLogger(logger),
+			// 取址失败（200 空响应）时换设备重取一次，避免整次播放 502。
+			media.WithRefresher(func(ctx context.Context) error {
+				_, err := registerDevice(ctx)
+				return err
+			}),
+		),
 	}, signer)
 
 	return &app{dirs: dirs, logger: logger, svc: svc}, nil

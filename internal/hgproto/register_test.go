@@ -2,10 +2,12 @@ package hgproto
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"hgplayer/internal/sign"
@@ -133,5 +135,93 @@ func TestPlayRegistersFreshDeviceOnEmptyResponse(t *testing.T) {
 	// 注册器返回的新设备必须成为当前设备。
 	if c.device.DeviceID != "new-device" {
 		t.Fatalf("device = %+v", c.device)
+	}
+}
+
+// TestSetDeviceConcurrentWithReads 并发换设备与读取身份必须安全（无撕裂值）。
+//
+// 媒体窗口并发抓取时会在取址失败后换设备，读取路径同时在签名时读身份；
+// 这里用并发读写 + 值一致性断言覆盖该场景（机器无 gcc 时无法跑 -race）。
+func TestSetDeviceConcurrentWithReads(t *testing.T) {
+	c := NewClient(sign.PlayerSigner{}, Device{DeviceID: "d0", IID: "i0"}, WithGuard(nil))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// 读取方：反复读取身份，断言 device_id 与 iid 始终来自同一份设备。
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				dev := c.currentDevice()
+				if want := "i" + strings.TrimPrefix(dev.DeviceID, "d"); dev.IID != want {
+					t.Errorf("身份撕裂: device_id=%q iid=%q", dev.DeviceID, dev.IID)
+					return
+				}
+			}
+		}()
+	}
+
+	// 写入方：反复换设备。
+	for i := 1; i <= 200; i++ {
+		c.SetDevice(Device{DeviceID: fmt.Sprintf("d%d", i), IID: fmt.Sprintf("i%d", i)})
+	}
+	close(stop)
+	wg.Wait()
+
+	if got := c.currentDevice().DeviceID; got != "d200" {
+		t.Fatalf("最终设备 = %q, want d200", got)
+	}
+}
+
+// recordingSigner 记录签名时收到的设备身份。
+type recordingSigner struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+// Sign 实现 sign.Signer。
+func (r *recordingSigner) Sign(sig sign.Signature) sign.Headers {
+	r.mu.Lock()
+	r.ids = append(r.ids, sig.DeviceID+"/"+sig.IID)
+	r.mu.Unlock()
+	return sign.Headers{}
+}
+
+// last 返回最近一次签名使用的身份。
+func (r *recordingSigner) last() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.ids) == 0 {
+		return ""
+	}
+	return r.ids[len(r.ids)-1]
+}
+
+// TestSetDeviceRebuildsUpstreamChannels 换设备后签名必须使用新身份。
+//
+// upstream.Client 在构造时就固定了 DeviceID/IID 参与签名；换设备若只改
+// Client.device 而不重建通道，后续请求的签名仍用旧身份（取址会一直被限流）。
+func TestSetDeviceRebuildsUpstreamChannels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	signer := &recordingSigner{}
+	c := NewClient(signer, Device{DeviceID: "111", IID: "222"}, WithGuard(nil))
+	c.SetDevice(Device{DeviceID: "333", IID: "444"})
+
+	if _, err := c.doJSON(context.Background(), http.MethodGet, srv.URL+"/x", nil, nil); err != nil {
+		t.Fatalf("doJSON: %v", err)
+	}
+	if got := signer.last(); got != "333/444" {
+		t.Fatalf("签名使用的身份 = %q, want 333/444（换设备后必须重建通道）", got)
 	}
 }

@@ -70,7 +70,7 @@ func (c *Client) Play(ctx context.Context, vid string) (*PlayInfo, error) {
 			if c.registrar != nil && attempt+1 < playbackDeviceAttempts && errors.Is(err, errEmptyUpstream) {
 				device, regErr := c.registrar(ctx)
 				if regErr == nil {
-					c.device = device
+					c.setDevice(device)
 					continue
 				}
 			}
@@ -131,15 +131,15 @@ func buildPlaybackBody(vid string) []byte {
 
 // playbackDeviceOrdered 返回取址请求的设备参数（插入序即签名顺序）。
 func (c *Client) playbackDeviceOrdered() []kv {
-	model, brand, osVersion, osAPI, resolution, dpi, channel, _ := c.device.profileOf()
+	model, brand, osVersion, osAPI, resolution, dpi, channel, _ := c.currentDevice().profileOf()
 	return []kv{
-		{"iid", c.device.IID},
-		{"device_id", c.device.DeviceID},
+		{"iid", c.currentDevice().IID},
+		{"device_id", c.currentDevice().DeviceID},
 		{"ac", "wifi"},
 		{"channel", channel},
 		{"aid", playbackAID},
 		{"app_name", "novelread"},
-		{"cdid", c.device.CDID},
+		{"cdid", c.currentDevice().CDID},
 		{"version_code", playbackVersionCode},
 		{"version_name", playbackVersionName},
 		{"device_platform", "android"},
@@ -161,7 +161,7 @@ func (c *Client) playbackDeviceOrdered() []kv {
 		{"need_personal_recommend", "1"},
 		{"player_so_load", "1"},
 		{"is_android_pad_screen", "0"},
-		{"openudid", c.device.OpenUDID},
+		{"openudid", c.currentDevice().OpenUDID},
 	}
 }
 
@@ -193,7 +193,7 @@ func (c *Client) playbackSigned(vid string) (string, map[string]string, []byte) 
 
 // playbackHeaders 组装取址请求头：桩签名之外的字段 + 真实 Argus 551 / Ladon。
 func (c *Client) playbackHeaders(query string, body []byte, khronos uint32, ticket int64) map[string]string {
-	model, _, osVersion, _, _, _, _, build := c.device.profileOf()
+	model, _, osVersion, _, _, _, _, build := c.currentDevice().profileOf()
 	headers := map[string]string{
 		"User-Agent":                playbackUserAgent(model, osVersion, build),
 		"Accept":                    "application/json; charset=utf-8,application/x-protobuf",
@@ -212,23 +212,23 @@ func (c *Client) playbackHeaders(query string, body []byte, khronos uint32, tick
 		"x-tt-dt":                   "",
 		"x-ss-stub":                 sign.MD5Upper(body),
 		"x-reading-request":         readingRequestID(ticket),
-		"x-argus":                   sign.Argus551(body, query, khronos, sign.RandomUint32(), playbackAID, c.device.DeviceID, c.device.IID),
+		"x-argus":                   sign.Argus551(body, query, khronos, sign.RandomUint32(), playbackAID, c.currentDevice().DeviceID, c.currentDevice().IID),
 		"x-ladon":                   sign.Ladon551(khronos, sign.RandomUint32(), playbackAID),
 	}
 	// 取址请求必须带设备 cookie（与在役客户端一致；未注册时没有 ttreq）。
-	if c.device.IID != "" {
-		region := c.device.StoreRegion
+	if c.currentDevice().IID != "" {
+		region := c.currentDevice().StoreRegion
 		if region == "" {
 			region = "cn-hb"
 		}
-		regionSrc := c.device.StoreRegionSrc
+		regionSrc := c.currentDevice().StoreRegionSrc
 		if regionSrc == "" {
 			regionSrc = "did"
 		}
 		cookie := "passport_csrf_token=; passport_csrf_token_default=; store-region=" + region +
-			"; store-region-src=" + regionSrc + "; install_id=" + c.device.IID
-		if c.device.TTReq != "" {
-			cookie += "; ttreq=" + c.device.TTReq
+			"; store-region-src=" + regionSrc + "; install_id=" + c.currentDevice().IID
+		if c.currentDevice().TTReq != "" {
+			cookie += "; ttreq=" + c.currentDevice().TTReq
 		}
 		headers["Cookie"] = cookie
 	}
