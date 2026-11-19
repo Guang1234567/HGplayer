@@ -1,0 +1,89 @@
+{
+  // 断点调试配置。配合 `task dev` 使用，顺序见各项 name。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 1) 终端先执行：task dev
+      // 2) 另开终端执行（把 dlv 挂到 wails dev 启动的进程上）：
+      //    dlv attach (Get-Process hgplayer).Id --headless --listen=127.0.0.1:2345 --api-version=2 --accept-multiclient
+      // 3) 再启动本配置，即可在 internal/server/handler_hgproto.go 等处下断点。
+      // 注意：dev 监视器在改动 *.go 后会重启应用，届时需要重新 attach。
+      "name": "Go: Attach (hgplayer)",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "host": "127.0.0.1",
+      "port": 2345
+    },
+    {
+      // 备选：不用 task dev，改由 dlv 直接拉起应用（断点更稳，不受 dev 重启影响）。
+      // Vite 9245 由 compound "全栈: Vite + Go" 一并启动；单独运行本配置时需先
+      // 手动启动 "前端: Vite Dev (9245)"。
+      "name": "Go: Launch DEV",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}",
+      "cwd": "${workspaceFolder}",
+      // 与 Taskfile 对齐：go build -buildvcs=false -gcflags=all="-N -l" -o "bin/hgplayer.exe"
+      // - -gcflags=all=-N -l（关闭优化与内联，作用于所有包含 wails 依赖）由 Delve
+      //   在 debug 模式下自动注入，不能也不需写进 buildFlags（写了会被忽略并告警）。
+      // - -buildvcs=false：构建期不写 VCS 信息，与 Taskfile 一致。
+      // - 输出路径用 output 字段（等价于 -o），不能把 -o 写进 buildFlags，
+      //   否则与扩展自带的 -o 冲突。
+      "buildFlags": [
+        "-buildvcs=false",
+        "-gcflags=all=-N -l"
+      ],
+      "dlvFlags": [],
+      "output": "${workspaceFolder}/bin/hgplayer.exe",
+      // true：先停在 main.main 入口，等下好断点后,点击「继续」按钮再放行；
+      // 该行仅在启动期执行一次，改代码后用「重启」按钮可再次命中。
+      "stopOnEntry": true,
+      "env": {
+        "FRONTEND_DEVSERVER_URL": "http://localhost:9245"
+      }
+    },
+    {
+      // 前端断点：附加到 WebView2 的远程调试端口（main.go 在 dev 模式下已开启 9222）。
+      // 页面由 Vite 提供，源映射回 frontend/src，可直接在 api/client.ts 下断点。
+      "name": "前端: 附加 WebView2 (9222)",
+      "type": "msedge",
+      "request": "attach",
+      "address": "127.0.0.1",
+      "port": 9222,
+      "urlFilter": "http://wails.localhost:9245/*",
+      "webRoot": "${workspaceFolder}/frontend",
+      "sourceMaps": true
+    },
+    {
+      "name": "前端: Vite Dev (9245)",
+      "type": "msedge",
+      "runtimeExecutable": "D:\\Applications\\Microsoft\\Edge\\Application_156\\msedge.exe",
+      "runtimeArgs": [
+        "--bwsi",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--enable-automation",
+      ],
+      "request": "launch",
+      "url": "http://localhost:7788",
+      "webRoot": "${workspaceFolder}/frontend",
+    },
+  ],
+  // 一键启动：同时拉起 Vite Dev(9245) 与 Go 调试。
+  // 注意：compound 内的配置是「并行」启动（与 preLaunchTask 的串行不同），
+  //       Vite 可能尚未就绪 Go 就已开窗；若首屏空白，稍等后刷新即可。
+  // 注意：Go 配置已不再带 preLaunchTask，避免与这里的 Vite 重复启动撞端口。
+  "compounds": [
+    {
+      "name": "全栈: Vite + Go",
+      "configurations": [
+        "前端: Vite Dev (9245)",
+        "Go: Launch DEV"
+      ],
+      "stopAll": true
+    }
+  ]
+}

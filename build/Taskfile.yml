@@ -78,29 +78,37 @@ tasks:
     # other's bundler is reading it, failing intermittently with
     # 'Could not resolve "./bindings/<pkg>"' (#4637).
     run: once
+    deps:
+      - task: install:frontend:deps
+      - task: generate:bindings
+        vars:
+          BUILD_MODE: '(DEV={{.DEV}})'
+          BUILD_FLAGS:
+            ref: .BUILD_FLAGS
+          OBFUSCATED:
+            ref: .OBFUSCATED
+    cmds:
+      - task: '{{if eq .DEV "true"}}frontend:run:dev{{else}}frontend:run:prod{{end}}'
+        vars:
+          SCRIPT: '{{if eq .DEV "true"}}dev{{else}}build{{end}}'
+    env:
+      PRODUCTION: '{{if eq .DEV "true"}}false{{else}}true{{end}}'
+
+  frontend:run:dev:
+    internal: true
+    dir: frontend
+    cmds:
+      - cmd: powershell -NoLogo -NoProfile -Command "if (-not (Test-Path ./dist/index.html)) { New-Item -Path ./dist/index.html -ItemType file -Force | Out-Null}; Set-Content -Path ./dist/index.html -Value '<!DOCTYPE html><html><body>dev mode</body></html>' -Encoding utf8"
+      - cmd: 'printf ''\033[33m%s\033[0m\n'' "WARN: skipping frontend build in dev mode (Vite dev server will handle it)"'
+
+  frontend:run:prod:
+    summary: Run a frontend script with selected runner
     dir: frontend
     sources:
       - "**/*"
       - exclude: node_modules/**/*
     generates:
       - dist/**/*
-    deps:
-      - task: install:frontend:deps
-      - task: generate:bindings
-        vars:
-          BUILD_FLAGS:
-            ref: .BUILD_FLAGS
-          OBFUSCATED:
-            ref: .OBFUSCATED
-    cmds:
-      - task: frontend:run
-        vars:
-          SCRIPT: '{{if eq .DEV "true"}}build:dev{{else}}build{{end}}'
-    env:
-      PRODUCTION: '{{if eq .DEV "true"}}false{{else}}true{{end}}'
-
-  frontend:run:
-    summary: Run a frontend script with selected runner
     cmds:
       - task: frontend:run:{{.PACKAGE_MANAGER}}
         vars:
@@ -174,6 +182,7 @@ tasks:
 
 
   generate:bindings:
+    label: generate:bindings (DEV={{.DEV}} RUNNER={{.PACKAGE_MANAGER}})
     summary: Generates bindings for the frontend
     run: once
     deps:
@@ -181,14 +190,18 @@ tasks:
     sources:
       - "**/*.[jt]s"
       - exclude: frontend/**/*
-      - frontend/bindings/**/*  # Rerun when switching between dev/production mode causes changes in output
       - "**/*.go"
       - go.mod
       - go.sum
     generates:
       - frontend/bindings/**/*
+    status:
+      # Rerun when switching between dev/production mode causes changes in output
+      - test -f frontend/.build_mode
+      - 'test "$(cat frontend/.build_mode)" = "{{.BUILD_MODE}}"'
     cmds:
       - wails3 generate bindings -f '{{.BUILD_FLAGS}}' -clean=true{{if eq .OBFUSCATED "true"}} -obfuscated{{end}} -ts -i
+      - 'printf ''%s\n'' "{{.BUILD_MODE}}" > frontend/.build_mode'
 
   generate:icons:
     summary: Generates Windows `.ico` and Mac `.icns` from an image; on macOS, `-iconcomposerinput appicon.icon -macassetdir darwin` also produces `Assets.car` from a `.icon` file (skipped on other platforms).
@@ -213,7 +226,7 @@ tasks:
   frontend:dev:npm:
     dir: frontend
     cmds:
-      - npm run dev -- --port {{.VITE_PORT}} --strictPort
+      - npm run dev -- --port {{.VITE_PORT}} --strictPort --host 127.0.0.1
 
   frontend:dev:yarn:
     dir: frontend

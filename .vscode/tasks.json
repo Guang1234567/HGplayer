@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // 供 "Go: Launch DEV" 的 preLaunchTask 调用：启动 Vite 开发服务器（9245）。
+      // 标记为 background：Vite 常驻不退出，靠 endsPattern 匹配到 "ready in …"
+      // 才算“就绪”，命中后 VS Code 才会继续拉起调试器。
+      "label": "vite:dev (9245)",
+      "type": "shell",
+      "command": "npm run dev -- --port 9245 --strictPort --host 127.0.0.1",
+      "options": {
+        "cwd": "${workspaceFolder}/frontend"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": {
+          "regexp": "^(.*)$",
+          "file": 1,
+          "message": 1
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*VITE.*",
+          "endsPattern": ".*(ready in|Local:).*"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}

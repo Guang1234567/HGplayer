@@ -11,7 +11,9 @@ import (
 	"embed"
 	"encoding/hex"
 	"log"
+	"net"
 	"net/http"
+	"os"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
@@ -43,6 +45,26 @@ func main() {
 		log.Fatalf("初始化失败: %v", err)
 	}
 
+	// 开发模式下（wails3 dev 会设置 FRONTEND_DEVSERVER_URL）为 WebView2 打开
+	// 远程调试端口，便于在 IDE 中附加调试前端代码。生产构建不设置该变量，
+	// 因此发布版本不会带调试端口。
+	var browserArgs []string
+	if os.Getenv("FRONTEND_DEVSERVER_URL") != "" {
+		browserArgs = []string{"--remote-debugging-port=9222"}
+	}
+
+	// 除桌面窗口外，再开放一个同源 HTTP 服务，便于用系统浏览器（含局域网内
+	// 其它设备）访问同一套前端与 /api、/media 后端。默认监听所有网卡
+	// （0.0.0.0:7788），启动时打印本机与局域网访问地址；可用 HGPLAYER_WEB_ADDR
+	// 覆盖（如需仅本机访问，设为 127.0.0.1:7788），设为 "-" 则关闭。
+	webAddr := os.Getenv("HGPLAYER_WEB_ADDR")
+	if webAddr == "" {
+		webAddr = "0.0.0.0:7788"
+	}
+	if webAddr != "-" {
+		go serveLoopback(webAddr, a.assetHandler())
+	}
+
 	w := application.New(application.Options{
 		Name:        "hgplayer",
 		Description: "红果短剧客户端（Go / Wails）",
@@ -50,6 +72,9 @@ func main() {
 			// 同源路由：/api、/media 由后端服务处理，
 			// 其余路径交由前端静态资源，保证前端与 API 同 origin。
 			Handler: a.assetHandler(),
+		},
+		Windows: application.WindowsOptions{
+			AdditionalBrowserArgs: browserArgs,
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
@@ -71,6 +96,92 @@ func main() {
 	if err := w.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// serveLoopback 以标准 HTTP 服务承载与桌面窗口相同的同源 handler，
+// 使前端也能用系统浏览器（含局域网内其它设备）访问；/api、/media 复用同一后端代码。
+func serveLoopback(addr string, handler http.Handler) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("浏览器访问服务启动失败（%s）: %v", addr, err)
+		return
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		port = "7788"
+	}
+	log.Printf("本机访问: http://127.0.0.1:%s", port)
+	// 优先只列出默认出站网卡地址（局域网内其它设备最可能访问到的那个）；
+	// 取不到时回退到枚举全部网卡。
+	// 用 HGPLAYER_WEB_PROBE 指定「访问方所处网段」的探针地址：
+	// 例如客户端在公司 10.x 网段时设为 10.1.161.1（如 10.1.161.100 对应 10.1.161.1），
+	// 即可打印出通往 10.x 的网卡地址；不设则探默认出站网卡。
+	if ip := primaryIP(os.Getenv("HGPLAYER_WEB_PROBE")); ip != "" {
+		log.Printf("局域网访问: http://%s:%s", ip, port)
+	} else {
+		for _, ip := range lanAddrs() {
+			log.Printf("局域网访问(候选): http://%s:%s", ip, port)
+		}
+	}
+	srv := &http.Server{Handler: handler}
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Printf("浏览器访问服务退出: %v", err)
+	}
+}
+
+// primaryIP 返回本机朝向 probe 目标所用路由的 IPv4 —— 也就是「打算从该网段访问的
+// 设备」会看到的源地址。UDP 无连接，仅触发一次本机路由查表，不会真正发包。
+//
+// probe 为空时用 RFC 5737 文档地址 192.0.2.1（探默认出站网卡）；
+// 传 10.1.161.1 这类目标则返回通往 10.x 网段的网卡地址（如 10.1.161.100）。
+func primaryIP(probe string) string {
+	if probe == "" {
+		probe = "192.0.2.1:9"
+	} else if _, _, err := net.SplitHostPort(probe); err != nil {
+		probe = net.JoinHostPort(probe, "9")
+	}
+	log.Printf("探针地址: %s", probe)
+	conn, err := net.Dial("udp4", probe)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		if ip := addr.IP.To4(); ip != nil && !ip.IsLoopback() {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+// lanAddrs 返回本机可用于局域网访问的 IPv4 地址（跳过未启用与回环网卡）。
+func lanAddrs() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			out = append(out, ip.String())
+		}
+	}
+	return out
 }
 
 // newApp 初始化数据目录、设备身份、协议客户端与应用服务。
